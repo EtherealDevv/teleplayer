@@ -24,6 +24,10 @@ Reproductor de vídeo de escritorio para Windows que usa un canal privado de Tel
 - Credenciales API propias de Telegram (`api_id` y `api_hash`).
 - Node.js 20.19 o superior y npm para ejecutar desde el código.
 
+## Descargar
+
+Descarga el instalador desde [GitHub Releases](https://github.com/EtherealDevv/teleplayer/releases/latest). No está firmado digitalmente, así que Windows SmartScreen puede mostrar una advertencia.
+
 ## Ejecutar desde el código
 
 ```powershell
@@ -38,7 +42,7 @@ npm run typecheck
 npm run dist
 ```
 
-El instalador queda en `dist/TelePlayer-Setup-<versión>.exe`. No está firmado digitalmente, así que Windows SmartScreen puede mostrar una advertencia.
+El instalador queda en `dist/TelePlayer-Setup-<versión>.exe`.
 
 ## Configurar Telegram
 
