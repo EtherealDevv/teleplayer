@@ -1,7 +1,20 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import type { DownloadProgress, Folder, StreamProgress, VideoItem } from '../../../shared/types'
+import { api } from '../api'
 import { cx, formatBytes, formatDuration, formatPercent, formatRelative, idHue, progressPercent } from '../utils'
 import { Icon } from './Icon'
+
+/** Segundos de vídeo que se reproducen al pasar el ratón por la portada. */
+const PREVIEW_SECONDS = 10
+/** Espera antes de pedir el vídeo: evita descargar al cruzar la rejilla. */
+const PREVIEW_DELAY_MS = 450
+
+/**
+ * Solo una tarjeta puede previsualizar a la vez. Sin esto, barrer el ratón
+ * sobre una carpeta abriría una veintena de sesiones contra Telegram y el
+ * servidor respondería con FLOOD_WAIT.
+ */
+let activePreviewStop: (() => void) | null = null
 
 interface VideoCardProps {
   video: VideoItem
@@ -32,8 +45,13 @@ export function VideoCard({
 }: VideoCardProps): JSX.Element {
   const [menuOpen, setMenuOpen] = useState(false)
   const [menuAbove, setMenuAbove] = useState(false)
+  const [previewSrc, setPreviewSrc] = useState<string | null>(null)
   const cardRef = useRef<HTMLDivElement | null>(null)
   const menuRef = useRef<HTMLDivElement | null>(null)
+  const previewRef = useRef<HTMLVideoElement | null>(null)
+  const previewTimerRef = useRef<number | null>(null)
+  const previewRequestRef = useRef(0)
+  const previewOpenedRef = useRef(false)
   const progress =
     video.watchDuration && video.watchDuration > 0
       ? progressPercent(video.watchPosition ?? 0, video.watchDuration)
@@ -55,8 +73,18 @@ export function VideoCard({
     const close = (event: MouseEvent): void => {
       if (cardRef.current && !cardRef.current.contains(event.target as Node)) setMenuOpen(false)
     }
+    const onKey = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') {
+        setMenuOpen(false)
+        cardRef.current?.focus()
+      }
+    }
     window.addEventListener('mousedown', close)
-    return () => window.removeEventListener('mousedown', close)
+    window.addEventListener('keydown', onKey)
+    return () => {
+      window.removeEventListener('mousedown', close)
+      window.removeEventListener('keydown', onKey)
+    }
   }, [menuOpen])
 
   useLayoutEffect(() => {
@@ -74,6 +102,63 @@ export function VideoCard({
     setMenuAbove(belowSpace < menu.offsetHeight && aboveSpace > belowSpace)
   }, [menuOpen])
 
+  const stopPreview = useCallback((): void => {
+    if (previewTimerRef.current) {
+      window.clearTimeout(previewTimerRef.current)
+      previewTimerRef.current = null
+    }
+    previewRequestRef.current += 1
+    setPreviewSrc(null)
+    const element = previewRef.current
+    if (element) element.pause()
+    if (previewOpenedRef.current) {
+      // La vista previa pedía bloques a Telegram; al salir de la tarjeta se
+      // deja de descargar en segundo plano. Los bloques ya bajados se quedan
+      // en la caché, así que el clic no empieza de cero.
+      previewOpenedRef.current = false
+      void api.playback.cancelStream(video.id).catch(() => undefined)
+    }
+    if (activePreviewStop === stopPreview) activePreviewStop = null
+  }, [video.id])
+
+  const startPreview = useCallback((): void => {
+    if (menuOpen) return
+    if (typeof window.matchMedia === 'function' && !window.matchMedia('(hover: hover)').matches) {
+      return
+    }
+    if (previewTimerRef.current) window.clearTimeout(previewTimerRef.current)
+    previewTimerRef.current = window.setTimeout(() => {
+      previewTimerRef.current = null
+      if (activePreviewStop && activePreviewStop !== stopPreview) {
+        // La tarjeta anterior deja de descargar antes de que esta empiece.
+        activePreviewStop()
+      }
+      activePreviewStop = stopPreview
+      const token = previewRequestRef.current + 1
+      previewRequestRef.current = token
+      previewOpenedRef.current = true
+      void api.playback
+        .open(video.id, true)
+        .then((result) => {
+          if (token !== previewRequestRef.current) return
+          if (result.url) setPreviewSrc(result.url)
+        })
+        .catch(() => {
+          previewOpenedRef.current = false
+        })
+    }, PREVIEW_DELAY_MS)
+  }, [menuOpen, stopPreview, video.id])
+
+  useEffect(() => {
+    if (menuOpen) stopPreview()
+  }, [menuOpen, stopPreview])
+
+  useEffect(() => {
+    return () => {
+      stopPreview()
+    }
+  }, [stopPreview])
+
   const run = (action: () => void): void => {
     setMenuOpen(false)
     action()
@@ -89,8 +174,13 @@ export function VideoCard({
       }}
     >
       <button
-        className="video-cover"
-        onClick={() => onPlay(video)}
+        className={cx('video-cover', previewSrc && 'previewing')}
+        onClick={() => {
+          stopPreview()
+          onPlay(video)
+        }}
+        onMouseEnter={startPreview}
+        onMouseLeave={stopPreview}
         aria-label={`Reproducir ${video.title}`}
       >
         <div
@@ -111,6 +201,27 @@ export function VideoCard({
             onError={(event) => {
               event.currentTarget.style.display = 'none'
             }}
+          />
+        ) : null}
+        {previewSrc ? (
+          <video
+            ref={previewRef}
+            className="cover-preview"
+            src={previewSrc}
+            muted
+            playsInline
+            autoPlay
+            preload="auto"
+            tabIndex={-1}
+            onTimeUpdate={(event) => {
+              // El adelanto es un vistazo, no un reproductor: a los 10 s vuelve
+              // a la portada para no seguir descargando en segundo plano.
+              if (event.currentTarget.currentTime >= PREVIEW_SECONDS) {
+                event.currentTarget.pause()
+                stopPreview()
+              }
+            }}
+            onError={stopPreview}
           />
         ) : null}
 

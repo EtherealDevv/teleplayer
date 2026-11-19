@@ -2,6 +2,8 @@ import { app, safeStorage } from 'electron'
 import fs from 'node:fs'
 import path from 'node:path'
 import type { AppSettings, CacheInfo, Folder, ThemeMode } from '../shared/types'
+import { CHUNK_SIZE, MANIFEST_SUFFIX, MANIFEST_VERSION } from './cache-format'
+import type { FileFingerprint } from './fingerprint'
 
 interface WatchEntry {
   t: number
@@ -21,6 +23,19 @@ interface ChannelInfo {
   title: string
 }
 
+/** Alias locales del formato compartido con `MediaStreamer`. */
+const PARTIAL_MANIFEST_VERSION = MANIFEST_VERSION
+const PARTIAL_CHUNK_SIZE = CHUNK_SIZE
+const PARTIAL_SUFFIX = MANIFEST_SUFFIX
+
+interface PartialCacheFile {
+  fileName: string
+  filePath: string
+  manifestPath: string
+  bytes: number
+  modifiedAt: number
+}
+
 interface PersistedState {
   version: 1
   apiId?: number
@@ -32,6 +47,8 @@ interface PersistedState {
   settings: AppSettings
   watch: Record<string, WatchEntry>
   cache: Record<string, CacheEntry>
+  /** Huella de contenido por vídeo, para no volver a subir un archivo renombrado. */
+  fingerprints?: Record<string, FileFingerprint>
 }
 
 const DEFAULTS: AppSettings = {
@@ -105,11 +122,30 @@ export class AppStore {
     this.cleanupOrphanedCache()
   }
 
+  /**
+   * Deja en la caché solo lo que se puede reutilizar: descargas completas
+   * registradas y pares vídeo+manifiesto de la caché progresiva. Antes se
+   * borraba todo lo que no estuviera en `state.cache`, así que cada reinicio
+   * tiraba lo descargado a medias y la reanudación moría con la app.
+   */
   private cleanupOrphanedCache(): void {
-    const known = new Set(Object.values(this.state.cache).map((entry) => entry.fileName))
+    const completed = new Set(Object.values(this.state.cache).map((entry) => entry.fileName))
+    const partials = this.listPartialCaches()
+    const keep = new Set<string>()
+    for (const partial of partials) {
+      if (completed.has(partial.fileName)) continue
+      keep.add(partial.fileName)
+      keep.add(`${partial.fileName}${PARTIAL_SUFFIX}`)
+    }
+    for (const fileName of completed) {
+      keep.add(fileName)
+      if (fs.existsSync(path.join(this.cacheDir, `${fileName}${PARTIAL_SUFFIX}`))) {
+        keep.add(`${fileName}${PARTIAL_SUFFIX}`)
+      }
+    }
     try {
       for (const name of fs.readdirSync(this.cacheDir)) {
-        if (known.has(name)) continue
+        if (keep.has(name)) continue
         try {
           fs.rmSync(path.join(this.cacheDir, name), { force: true })
         } catch {
@@ -119,6 +155,53 @@ export class AppStore {
     } catch {
       // The cache folder may not exist yet.
     }
+  }
+
+  /**
+   * Pares manifiesto+vídeo de la caché progresiva. Un manifiesto sin su vídeo
+   * (o al revés) no sirve para reanudar nada y se descarta al arrancar.
+   */
+  private listPartialCaches(): PartialCacheFile[] {
+    const result: PartialCacheFile[] = []
+    let entries: string[]
+    try {
+      entries = fs.readdirSync(this.cacheDir)
+    } catch {
+      return result
+    }
+    for (const name of entries) {
+      if (!name.endsWith(PARTIAL_SUFFIX)) continue
+      const manifestPath = path.join(this.cacheDir, name)
+      const fileName = name.slice(0, -PARTIAL_SUFFIX.length)
+      const filePath = path.join(this.cacheDir, fileName)
+      try {
+        const parsed = JSON.parse(fs.readFileSync(manifestPath, 'utf8')) as {
+          version?: number
+          totalSize?: number
+          chunkSize?: number
+        }
+        if (
+          parsed.version !== PARTIAL_MANIFEST_VERSION ||
+          parsed.chunkSize !== PARTIAL_CHUNK_SIZE ||
+          !Number.isFinite(parsed.totalSize) ||
+          Number(parsed.totalSize) <= 0
+        ) {
+          continue
+        }
+        const stat = fs.statSync(filePath)
+        if (!stat.isFile() || stat.size <= 0) continue
+        result.push({
+          fileName,
+          filePath,
+          manifestPath,
+          bytes: stat.size,
+          modifiedAt: stat.mtimeMs
+        })
+      } catch {
+        // Manifiesto ilegible o vídeo ausente: no se puede reanudar.
+      }
+    }
+    return result
   }
 
   private load(): PersistedState {
@@ -138,7 +221,9 @@ export class AppStore {
       foldersCache: Array.isArray(raw.foldersCache) ? raw.foldersCache : [],
       settings: sanitizeSettings(raw.settings),
       watch: raw.watch && typeof raw.watch === 'object' ? raw.watch : {},
-      cache: raw.cache && typeof raw.cache === 'object' ? raw.cache : {}
+      cache: raw.cache && typeof raw.cache === 'object' ? raw.cache : {},
+      fingerprints:
+        raw.fingerprints && typeof raw.fingerprints === 'object' ? raw.fingerprints : {}
     }
   }
 
@@ -302,23 +387,45 @@ export class AppStore {
         } catch {
           // The player may still hold the file; it will be cleaned up later.
         }
+        try {
+          fs.rmSync(`${file}${PARTIAL_SUFFIX}`, { force: true })
+        } catch {
+          // Same as the video file: retried on the next startup cleanup.
+        }
       }
     }
     delete this.state.cache[videoId]
-    const thumb = this.getThumbPath(videoId)
-    if (thumb) {
-      try {
-        fs.rmSync(thumb, { force: true })
-      } catch {
-        // Ignore locked thumbnails.
-      }
-    }
+    this.removeThumb(videoId)
+    this.removeFingerprint(videoId)
     this.persist()
   }
 
   getThumbPath(videoId: string): string | null {
     if (!/^[a-zA-Z0-9-]{8,64}$/.test(videoId)) return null
     return path.join(this.thumbsDir, `${videoId}.jpg`)
+  }
+
+  /**
+   * Restos de la caché progresiva de un vídeo que ya no existe: el archivo
+   * `${videoId}<ext>` y su manifiesto. Sin esto, borrar un vídeo a medias dejaba
+   * sus bloques en disco hasta el siguiente arranque.
+   */
+  removePartialCache(videoId: string): void {
+    if (!/^[a-zA-Z0-9-]{8,64}$/.test(videoId)) return
+    let entries: string[]
+    try {
+      entries = fs.readdirSync(this.cacheDir)
+    } catch {
+      return
+    }
+    for (const name of entries) {
+      if (!name.startsWith(`${videoId}.`)) continue
+      try {
+        fs.rmSync(path.join(this.cacheDir, name), { force: true })
+      } catch {
+        // Locked by the player; the startup cleanup retries.
+      }
+    }
   }
 
   hasThumb(videoId: string): boolean {
@@ -331,9 +438,69 @@ export class AppStore {
     }
   }
 
+  /** Borra la portada de un vídeo que no llegó a entrar en la biblioteca. */
+  removeThumb(videoId: string): void {
+    const file = this.getThumbPath(videoId)
+    if (!file) return
+    try {
+      fs.rmSync(file, { force: true })
+    } catch {
+      // A locked JPEG is retried with the rest of the cache cleanup.
+    }
+  }
+
+  /**
+   * Portadas sin vídeo en la biblioteca (importaciones fallidas, vídeos
+   * borrados desde Telegram). `keep` lo calcula el servicio, que es quien
+   * conoce el índice.
+   */
+  pruneThumbs(keep: Set<string>): number {
+    let removed = 0
+    let entries: string[]
+    try {
+      entries = fs.readdirSync(this.thumbsDir)
+    } catch {
+      return removed
+    }
+    for (const name of entries) {
+      if (!name.endsWith('.jpg')) continue
+      const videoId = name.slice(0, -4)
+      if (keep.has(videoId)) continue
+      try {
+        fs.rmSync(path.join(this.thumbsDir, name), { force: true })
+        removed += 1
+      } catch {
+        // Locked by the renderer; next start will try again.
+      }
+    }
+    return removed
+  }
+
+  /** Huellas de contenido de la biblioteca: hash → vídeo. */
+  fingerprintIndex(): Map<string, string> {
+    const map = new Map<string, string>()
+    for (const [videoId, fingerprint] of Object.entries(this.state.fingerprints ?? {})) {
+      if (fingerprint && typeof fingerprint.hash === 'string') map.set(fingerprint.hash, videoId)
+    }
+    return map
+  }
+
+  setFingerprint(videoId: string, fingerprint: FileFingerprint): void {
+    this.state.fingerprints = { ...(this.state.fingerprints ?? {}), [videoId]: fingerprint }
+    this.persist()
+  }
+
+  removeFingerprint(videoId: string): void {
+    const fingerprints = this.state.fingerprints
+    if (!fingerprints || !(videoId in fingerprints)) return
+    delete fingerprints[videoId]
+    this.persist()
+  }
+
   cacheInfo(): CacheInfo {
     let bytes = 0
     let files = 0
+    const completed = new Set(Object.values(this.state.cache).map((entry) => entry.fileName))
     for (const [, entry] of Object.entries(this.state.cache)) {
       const file = this.safeCachePath(entry.fileName)
       if (!file) continue
@@ -347,10 +514,19 @@ export class AppStore {
         // Ignore stale entries.
       }
     }
+    let partialBytes = 0
+    let partialFiles = 0
+    for (const partial of this.listPartialCaches()) {
+      if (completed.has(partial.fileName)) continue
+      partialBytes += partial.bytes
+      partialFiles += 1
+    }
     return {
       bytes,
       files,
-      limitBytes: this.settings.cacheLimitGb * 1024 * 1024 * 1024
+      limitBytes: this.settings.cacheLimitGb * 1024 * 1024 * 1024,
+      partialBytes,
+      partialFiles
     }
   }
 
@@ -358,28 +534,61 @@ export class AppStore {
     const limitGb = this.settings.cacheLimitGb
     if (!limitGb || limitGb <= 0) return []
     const limit = limitGb * 1024 * 1024 * 1024
-    const entries = Object.entries(this.state.cache).sort(
-      (a, b) => a[1].downloadedAt - b[1].downloadedAt
-    )
-    let total = entries.reduce((sum, [, entry]) => sum + entry.size, 0)
-    const evicted: string[] = []
-    for (const [videoId, entry] of entries) {
-      if (total <= limit) break
-      if (videoId === excludeVideoId || protectedIds?.has(videoId)) continue
-      const file = this.safeCachePath(entry.fileName)
-      if (file) {
-        try {
-          fs.rmSync(file, { force: true })
-          total -= entry.size
-          delete this.state.cache[videoId]
-          evicted.push(videoId)
-        } catch {
-          // File is likely being played; try again next time.
+    const entries = Object.entries(this.state.cache)
+      .sort((a, b) => a[1].downloadedAt - b[1].downloadedAt)
+      .map(([videoId, entry]) => {
+        const file = this.safeCachePath(entry.fileName)
+        let size = entry.size
+        if (file) {
+          try {
+            size = fs.statSync(file).size
+          } catch {
+            // Keep the registered size when the file is already gone.
+          }
         }
-      } else {
-        total -= entry.size
+        return { videoId, entry, file, size }
+      })
+    const completedNames = new Set(entries.map((item) => item.entry.fileName))
+    const partials = this.listPartialCaches()
+      .filter((partial) => !completedNames.has(partial.fileName))
+      .sort((a, b) => a.modifiedAt - b.modifiedAt)
+    let total =
+      entries.reduce((sum, item) => sum + item.size, 0) +
+      partials.reduce((sum, partial) => sum + partial.bytes, 0)
+    const evicted: string[] = []
+    const isProtected = (videoId: string): boolean =>
+      videoId === excludeVideoId || Boolean(protectedIds?.has(videoId))
+    for (const { videoId, entry, file, size } of entries) {
+      if (total <= limit) break
+      if (isProtected(videoId)) continue
+      if (!file) {
+        total -= size
         delete this.state.cache[videoId]
         evicted.push(videoId)
+        continue
+      }
+      try {
+        fs.rmSync(file, { force: true })
+        fs.rmSync(`${file}${PARTIAL_SUFFIX}`, { force: true })
+        total -= size
+        delete this.state.cache[videoId]
+        evicted.push(videoId)
+      } catch {
+        // File is likely being played; try again next time.
+      }
+    }
+    // La caché progresiva también ocupa disco. Si después de vaciar las
+    // descargas completas se sigue por encima del límite, se van los bloques
+    // más viejos (los que llevan más tiempo sin reproducirse).
+    for (const partial of partials) {
+      if (total <= limit) break
+      if (excludeVideoId && partial.fileName.startsWith(excludeVideoId)) continue
+      try {
+        fs.rmSync(partial.filePath, { force: true })
+        fs.rmSync(partial.manifestPath, { force: true })
+        total -= partial.bytes
+      } catch {
+        // Locked by the player; next prune will pick it up.
       }
     }
     if (evicted.length > 0) this.persist()

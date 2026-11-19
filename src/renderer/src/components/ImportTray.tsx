@@ -6,9 +6,16 @@ import { Icon } from './Icon'
 interface ImportTrayProps {
   jobs: Record<string, ImportProgress>
   onDismiss: (jobId: string) => void
+  onCancel: (jobId: string) => void
+  onRetry: (jobId: string) => void
 }
 
-export function ImportTray({ jobs, onDismiss }: ImportTrayProps): JSX.Element | null {
+export function ImportTray({
+  jobs,
+  onDismiss,
+  onCancel,
+  onRetry
+}: ImportTrayProps): JSX.Element | null {
   const [collapsed, setCollapsed] = useState(false)
   const ordered = useMemo(() => {
     const list = Object.values(jobs)
@@ -25,7 +32,9 @@ export function ImportTray({ jobs, onDismiss }: ImportTrayProps): JSX.Element | 
     (job) => job.status === 'uploading' || job.status === 'preparing' || job.status === 'queued'
   )
   const done = ordered.filter((job) => job.status === 'done')
-  const failed = ordered.filter((job) => job.status === 'error')
+  const failed = ordered.filter(
+    (job) => job.status === 'error' || job.status === 'cancelled'
+  )
 
   if (collapsed) {
     return (
@@ -67,7 +76,8 @@ export function ImportTray({ jobs, onDismiss }: ImportTrayProps): JSX.Element | 
       <div className="import-list">
         {ordered.map((job) => {
           const percent = progressPercent(job.uploadedBytes, job.totalBytes)
-          const isActive = job.status === 'uploading' || job.status === 'preparing'
+          const isActive =
+            job.status === 'uploading' || job.status === 'preparing' || job.status === 'queued'
           const isDone = job.status === 'done'
           const isError = job.status === 'error' || job.status === 'cancelled'
           return (
@@ -89,15 +99,32 @@ export function ImportTray({ jobs, onDismiss }: ImportTrayProps): JSX.Element | 
                   </span>
                 </div>
                 {isActive ? (
-                  <span className="import-percent">{formatPercent(percent)}%</span>
+                  <div className="import-item-actions">
+                    <span className="import-percent">{formatPercent(percent)}%</span>
+                    <button
+                      className="icon-btn small danger"
+                      onClick={() => onCancel(job.jobId)}
+                      aria-label="Cancelar subida"
+                      title="Cancelar subida"
+                    >
+                      <Icon name="stop_circle" size={17} />
+                    </button>
+                  </div>
                 ) : (
-                  <button
-                    className="icon-btn small"
-                    onClick={() => onDismiss(job.jobId)}
-                    aria-label="Quitar de la lista"
-                  >
-                    <Icon name="close" size={17} />
-                  </button>
+                  <div className="import-item-actions">
+                    {isError ? (
+                      <button className="import-retry" onClick={() => onRetry(job.jobId)}>
+                        <Icon name="refresh" size={15} /> Reintentar
+                      </button>
+                    ) : null}
+                    <button
+                      className="icon-btn small"
+                      onClick={() => onDismiss(job.jobId)}
+                      aria-label="Quitar de la lista"
+                    >
+                      <Icon name="close" size={17} />
+                    </button>
+                  </div>
                 )}
               </div>
 
@@ -109,7 +136,12 @@ export function ImportTray({ jobs, onDismiss }: ImportTrayProps): JSX.Element | 
                   <span className="import-detail">{job.detail || 'Preparando…'}</span>
                 </>
               ) : isError ? (
-                <span className="import-error">{job.error || 'No se pudo subir el vídeo.'}</span>
+                <span className="import-error">
+                  {job.error ||
+                    (job.status === 'cancelled'
+                      ? 'Subida cancelada. Puedes reintentarla cuando quieras.'
+                      : 'No se pudo subir el vídeo.')}
+                </span>
               ) : (
                 <span className="import-detail">
                   <Icon name="cloud_done" size={14} /> Guardado en tu canal privado

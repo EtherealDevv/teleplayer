@@ -35,7 +35,9 @@ interface LibraryViewProps {
   streams: Record<string, StreamProgress>
   onPlay: (video: VideoItem) => void
   onImport: () => void
+  onImportFolder: () => void
   onRefresh: (silent?: boolean) => Promise<void>
+  onLoadMore: () => Promise<void>
   onClearQuery: () => void
   onToast: (message: string, tone?: ToastTone) => void
 }
@@ -57,7 +59,9 @@ export function LibraryView({
   streams,
   onPlay,
   onImport,
+  onImportFolder,
   onRefresh,
+  onLoadMore,
   onClearQuery,
   onToast
 }: LibraryViewProps): JSX.Element {
@@ -69,6 +73,7 @@ export function LibraryView({
   const [renameTarget, setRenameTarget] = useState<VideoItem | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<VideoItem | null>(null)
   const [busy, setBusy] = useState(false)
+  const [loadingMore, setLoadingMore] = useState(false)
 
   const activeFolder = library.folders.find((folder) => folder.id === folderId)
   const normalizedQuery = normalizeSearch(query)
@@ -223,6 +228,18 @@ export function LibraryView({
     void api.playback.reveal(video.id)
   }
 
+  const loadMore = async (): Promise<void> => {
+    if (loadingMore) return
+    setLoadingMore(true)
+    try {
+      await onLoadMore()
+    } catch (caught) {
+      onToast(cleanError(caught), 'error')
+    } finally {
+      setLoadingMore(false)
+    }
+  }
+
   const headerIcon = searching ? (
     <Icon name="search" size={21} />
   ) : folderId === 'all' ? (
@@ -259,9 +276,9 @@ export function LibraryView({
               ? `${visibleVideos.length} ${
                   visibleVideos.length === 1 ? 'resultado' : 'resultados'
                 } para «${query.trim()}»`
-              : `${visibleVideos.length} ${
+              : `${visibleVideos.length}${library.hasMore ? '+' : ''} ${
                   visibleVideos.length === 1 ? 'vídeo' : 'vídeos'
-                } · ${formatBytes(totalVisibleSize)}`}
+                } · ${formatBytes(totalVisibleSize)}${library.hasMore ? ' cargados' : ''}`}
           </p>
         </div>
 
@@ -307,6 +324,14 @@ export function LibraryView({
             disabled={loading}
           >
             <Icon name="refresh" size={21} />
+          </button>
+          <button
+            className="icon-btn"
+            onClick={onImportFolder}
+            title="Añadir carpeta con sus vídeos"
+            aria-label="Añadir carpeta"
+          >
+            <Icon name="create_new_folder" size={21} />
           </button>
           <button className="icon-btn header-add" onClick={onImport} title="Añadir vídeos" aria-label="Añadir vídeos">
             <Icon name="add" size={22} />
@@ -379,6 +404,9 @@ export function LibraryView({
               </>
             ) : null}
             <div className="library-summary-spacer" />
+            <button className="btn text small" onClick={onImportFolder}>
+              <Icon name="create_new_folder" size={17} /> Añadir carpeta
+            </button>
             <button className="btn text small" onClick={onImport}>
               <Icon name="add" size={17} /> Añadir vídeos
             </button>
@@ -396,30 +424,51 @@ export function LibraryView({
             ))}
           </div>
         ) : visibleVideos.length > 0 ? (
-          <div className="video-grid">
-            {visibleVideos.map((video) => (
-              <VideoCard
-                key={video.id}
-                video={video}
-                folder={
-                  video.folderId
-                    ? library.folders.find((folder) => folder.id === video.folderId)
-                    : undefined
-                }
-                download={downloads[video.id]}
-                stream={streams[video.id]}
-                onPlay={onPlay}
-                onMove={setMoveTarget}
-                onRename={setRenameTarget}
-                onDelete={setDeleteTarget}
-                onDownload={(item) => void downloadVideo(item)}
-                onOpenExternal={(item) => void openExternal(item)}
-                onReveal={reveal}
-              />
-            ))}
-          </div>
-        ) : searching ? (
-          <div className="empty-state">
+          <>
+            <div className="video-grid">
+              {visibleVideos.map((video) => (
+                <VideoCard
+                  key={video.id}
+                  video={video}
+                  folder={
+                    video.folderId
+                      ? library.folders.find((folder) => folder.id === video.folderId)
+                      : undefined
+                  }
+                  download={downloads[video.id]}
+                  stream={streams[video.id]}
+                  onPlay={onPlay}
+                  onMove={setMoveTarget}
+                  onRename={setRenameTarget}
+                  onDelete={setDeleteTarget}
+                  onDownload={(item) => void downloadVideo(item)}
+                  onOpenExternal={(item) => void openExternal(item)}
+                  onReveal={reveal}
+                />
+              ))}
+            </div>
+            {library.hasMore && !searching ? (
+              <div className="library-more">
+                <button
+                  className="btn tonal"
+                  onClick={() => void loadMore()}
+                  disabled={loadingMore}
+                >
+                  {loadingMore ? (
+                    <span className="mini-spinner" />
+                  ) : (
+                    <Icon name="expand_more" size={19} />
+                  )}
+                  {loadingMore ? 'Cargando vídeos…' : 'Cargar vídeos anteriores'}
+                </button>
+                <span className="library-more-hint">
+                  El historial de Telegram se pide por páginas: la biblioteca carga antes y el
+                  resto llega solo cuando lo necesitas.
+                </span>
+              </div>
+            ) : null}
+          </>
+        ) : searching ? (          <div className="empty-state">
             <div className="empty-orbit search">
               <Icon name="search_off" size={38} />
             </div>
@@ -444,9 +493,22 @@ export function LibraryView({
               <button className="btn filled" onClick={onImport}>
                 <Icon name="add" size={19} /> Añadir vídeos
               </button>
+              <button className="btn tonal" onClick={onImportFolder}>
+                <Icon name="create_new_folder" size={19} /> Añadir carpeta
+              </button>
               <button className="btn text" onClick={() => void onRefresh()}>
                 Actualizar
               </button>
+              {library.hasMore ? (
+                <button
+                  className="btn text"
+                  onClick={() => void loadMore()}
+                  disabled={loadingMore}
+                >
+                  <Icon name="expand_more" size={17} />
+                  {loadingMore ? 'Cargando…' : 'Buscar en vídeos anteriores'}
+                </button>
+              ) : null}
             </div>
           </div>
         ) : (
@@ -459,9 +521,14 @@ export function LibraryView({
               Añade tu primer vídeo y TelePlayer lo guardará en tu canal privado de Telegram. Sin
               cuotas, sin perder calidad y con soporte para archivos de más de 2 GB.
             </p>
-            <button className="btn filled lg" onClick={onImport}>
-              <Icon name="add_to_photos" size={20} /> Añadir mi primer vídeo
-            </button>
+            <div className="empty-actions">
+              <button className="btn filled lg" onClick={onImport}>
+                <Icon name="add_to_photos" size={20} /> Añadir mi primer vídeo
+              </button>
+              <button className="btn tonal lg" onClick={onImportFolder}>
+                <Icon name="create_new_folder" size={20} /> Añadir una carpeta
+              </button>
+            </div>
             <span className="empty-hint">
               <Icon name="lock" size={15} /> Solo tú puedes acceder a este canal
             </span>

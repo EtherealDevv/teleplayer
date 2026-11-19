@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer } from 'electron'
+import { contextBridge, ipcRenderer, webUtils } from 'electron'
 import type {
   AppSettings,
   AuthState,
@@ -32,8 +32,30 @@ const api: WindowApi = {
   },
   library: {
     refresh: (silent?: boolean) => ipcRenderer.invoke('library:refresh', silent),
+    loadMore: () => ipcRenderer.invoke('library:load-more'),
+    imports: () => ipcRenderer.invoke('library:imports'),
+    cancelImport: (jobId: string) => ipcRenderer.invoke('library:cancel-import', jobId),
+    retryImport: (jobId: string) => ipcRenderer.invoke('library:retry-import', jobId),
+    rebuildCovers: () => ipcRenderer.invoke('library:rebuild-covers'),
     importDialog: (folderId: string | null) =>
       ipcRenderer.invoke('library:import-dialog', folderId),
+    importFolderDialog: (folderId: string | null) =>
+      ipcRenderer.invoke('library:import-folder-dialog', folderId),
+    importPaths: (paths: string[], folderId: string | null) =>
+      ipcRenderer.invoke('library:import-paths', paths, folderId),
+    /**
+     * Electron quitó `File.path`: la única forma fiable de saber de dónde
+     * viene un archivo arrastrado es preguntárselo al proceso principal.
+     */
+    pathForFile: (file: unknown): string => {
+      try {
+        return webUtils.getPathForFile(
+          file as Parameters<typeof webUtils.getPathForFile>[0]
+        )
+      } catch {
+        return ''
+      }
+    },
     deleteVideo: (videoId: string) => ipcRenderer.invoke('library:delete-video', videoId),
     moveVideo: (videoId: string, folderId: string | null) =>
       ipcRenderer.invoke('library:move-video', videoId, folderId),
@@ -49,11 +71,13 @@ const api: WindowApi = {
     openCacheFolder: () => ipcRenderer.invoke('library:open-cache-folder')
   },
   playback: {
-    open: (videoId: string) => ipcRenderer.invoke('playback:open', videoId),
+    open: (videoId: string, preview?: boolean) =>
+      ipcRenderer.invoke('playback:open', videoId, preview),
     status: (videoId: string) => ipcRenderer.invoke('playback:status', videoId),
     streamStatus: (videoId: string) => ipcRenderer.invoke('playback:stream-status', videoId),
     url: (videoId: string) => ipcRenderer.invoke('playback:url', videoId),
     cancel: (videoId: string) => ipcRenderer.invoke('playback:cancel', videoId),
+    cancelStream: (videoId: string) => ipcRenderer.invoke('playback:cancel-stream', videoId),
     download: (videoId: string) => ipcRenderer.invoke('playback:download', videoId),
     setActive: (videoId: string | null) => ipcRenderer.invoke('playback:set-active', videoId),
     saveProgress: (videoId: string, position: number, duration: number) =>

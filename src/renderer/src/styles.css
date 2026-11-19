@@ -1967,6 +1967,7 @@ html.dark .chat-scroll {
 
 .cover-fallback,
 .cover-image,
+.cover-preview,
 .cover-shade {
   position: absolute;
   inset: 0;
@@ -1977,6 +1978,35 @@ html.dark .chat-scroll {
   height: 100%;
   object-fit: cover;
   user-select: none;
+}
+
+/*
+ * Vista previa al pasar el ratón: el primer fotograma de portada se sustituye
+ * por el vídeo en marcha. `pointer-events: none` deja que el clic siga siendo
+ * del botón que envuelve la portada.
+ */
+.cover-preview {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  background: #101214;
+  pointer-events: none;
+  animation: cover-preview-in 200ms var(--ease) both;
+}
+
+@keyframes cover-preview-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cover-preview {
+    animation: none;
+  }
 }
 
 .cover-shade {
@@ -5244,6 +5274,12 @@ html.dark .onboarding {
   transform: translate(-50%, -50%) scale(1);
 }
 
+/* Con la vista previa en marcha el botón de reproducir estorba sobre el vídeo. */
+.video-cover.previewing .card-play {
+  opacity: 0;
+  transform: translate(-50%, -50%) scale(0.86);
+}
+
 .duration-chip {
   padding: 2px 6px;
   border-radius: 6px;
@@ -5732,5 +5768,453 @@ html.dark .onboarding {
 @media (max-height: 740px) {
   .sidebar-fab {
     bottom: 144px;
+  }
+}
+
+/* Arrastrar y soltar + importar carpetas */
+
+.sidebar-fab-row {
+  position: absolute;
+  right: 20px;
+  bottom: 160px;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+
+.sidebar-fab-row .sidebar-fab {
+  position: static;
+  right: auto;
+  bottom: auto;
+}
+
+.sidebar-fab.ghost {
+  width: 40px;
+  height: 40px;
+  background: var(--tg-card-bg);
+  color: var(--tg-text-secondary);
+  border: 1px solid color-mix(in srgb, var(--tg-divider) 85%, transparent);
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.14);
+}
+
+.sidebar-fab.ghost:hover {
+  background: var(--tg-hover);
+  color: var(--tg-accent);
+}
+
+.drop-overlay {
+  position: fixed;
+  inset: var(--titlebar-height) 0 0 0;
+  z-index: 400;
+  display: grid;
+  place-items: center;
+  padding: 28px;
+  background: color-mix(in srgb, var(--tg-chat-bg) 68%, transparent);
+  backdrop-filter: blur(7px);
+  pointer-events: none;
+  animation: drop-overlay-in 140ms var(--ease);
+}
+
+.drop-card {
+  width: min(460px, 100%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 34px 30px;
+  border-radius: 18px;
+  border: 2px dashed color-mix(in srgb, var(--tg-accent) 55%, transparent);
+  background: color-mix(in srgb, var(--tg-card-bg) 94%, transparent);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.22);
+  text-align: center;
+}
+
+.drop-icon {
+  width: 72px;
+  height: 72px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--tg-accent-soft);
+  color: var(--tg-accent);
+}
+
+.drop-card h2 {
+  margin: 0;
+  color: var(--tg-text);
+  font-size: 19px;
+  font-weight: 600;
+  letter-spacing: -0.2px;
+}
+
+.drop-card p {
+  margin: 0;
+  max-width: 360px;
+  color: var(--tg-text-secondary);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+@keyframes drop-overlay-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@media (max-width: 1060px) {
+  .sidebar-fab-row {
+    right: 16px;
+  }
+}
+
+@media (max-height: 740px) {
+  .sidebar-fab-row {
+    bottom: 144px;
+  }
+}
+
+/* =========================================================
+   Premium interactions
+   ========================================================= */
+
+/*
+ * El foco de teclado se ve en cualquier control, tambi�n en los que tienen
+ * fondo propio (men�s, tarjetas, botones de icono). Es la misma marca suave
+ * que el resto de la interfaz, no un anillo del navegador.
+ */
+button:focus-visible,
+a:focus-visible,
+[role='button']:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--tg-accent) 78%, transparent);
+  outline-offset: 2px;
+}
+
+/* Botones de icono: se despegan un punto y vuelven al pulsar. */
+.icon-btn {
+  transition:
+    background 140ms var(--ease),
+    color 140ms var(--ease),
+    transform 140ms var(--ease),
+    box-shadow 140ms var(--ease);
+}
+
+.icon-btn:hover {
+  transform: translateY(-1px);
+}
+
+.icon-btn:active {
+  transform: scale(0.93);
+}
+
+.icon-btn.danger:hover {
+  background: color-mix(in srgb, var(--tg-red) 14%, transparent);
+  color: var(--tg-red);
+}
+
+.icon-btn.spinning:hover {
+  transform: none;
+}
+
+/* La tarjeta sube con m�s aire y la portada acierta el borde al pasar. */
+.video-card {
+  transition:
+    transform 240ms var(--ease),
+    box-shadow 240ms var(--ease),
+    border-color 240ms var(--ease);
+}
+
+.video-card:hover {
+  transform: translateY(-4px);
+  border-color: color-mix(in srgb, var(--tg-accent) 32%, var(--tg-divider));
+  box-shadow:
+    0 20px 42px -16px rgba(0, 0, 0, 0.42),
+    0 2px 6px rgba(0, 0, 0, 0.08);
+}
+
+.video-card:active {
+  transform: translateY(-1px) scale(0.997);
+}
+
+.video-card .cover-shade {
+  transition: opacity 240ms var(--ease);
+}
+
+.video-card:hover .cover-shade {
+  opacity: 0.86;
+}
+
+.video-card .card-play {
+  transition:
+    opacity 170ms var(--ease),
+    transform 220ms var(--ease),
+    background 170ms var(--ease);
+}
+
+.video-card:hover .card-play {
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.42);
+}
+
+.card-play .tp-icon {
+  transition: transform 220ms var(--ease);
+}
+
+.video-card:hover .card-play .tp-icon {
+  transform: scale(1.06);
+}
+
+.card-menu-btn {
+  transition:
+    background 140ms var(--ease),
+    color 140ms var(--ease),
+    opacity 160ms var(--ease),
+    transform 140ms var(--ease);
+}
+
+.card-menu-btn:hover,
+.video-card .card-menu-btn:hover {
+  transform: scale(1.08);
+}
+
+.video-card .card-menu-btn:active {
+  transform: scale(0.92);
+}
+
+/* =========================================================
+   Men� contextual de la tarjeta
+   ========================================================= */
+
+.card-menu {
+  transform-origin: top right;
+  animation: menu-in 160ms var(--ease);
+  box-shadow:
+    0 18px 46px -12px rgba(0, 0, 0, 0.5),
+    0 2px 8px rgba(0, 0, 0, 0.16),
+    inset 0 1px 0 color-mix(in srgb, #ffffff 8%, transparent);
+}
+
+.card-menu.above {
+  transform-origin: bottom right;
+}
+
+.card-menu button {
+  position: relative;
+  overflow: hidden;
+  transition:
+    background 130ms var(--ease),
+    color 130ms var(--ease),
+    padding-left 130ms var(--ease);
+  animation: menu-item-in 240ms var(--ease) backwards;
+}
+
+.card-menu button:nth-child(1) { animation-delay: 14ms; }
+.card-menu button:nth-child(2) { animation-delay: 28ms; }
+.card-menu button:nth-child(3) { animation-delay: 42ms; }
+.card-menu button:nth-child(4) { animation-delay: 56ms; }
+.card-menu button:nth-child(5) { animation-delay: 70ms; }
+.card-menu button:nth-child(6) { animation-delay: 84ms; }
+.card-menu button:nth-child(7) { animation-delay: 98ms; }
+.card-menu button:nth-child(n + 8) { animation-delay: 110ms; }
+
+/*
+ * El barrido sale del icono y se queda detr�s del texto: el mismo gesto que
+ * la app usa en el resto de listas, pero aqu� m�s corto y m�s seco.
+ */
+.card-menu button::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--tg-accent) 18%, transparent),
+    transparent 72%
+  );
+  opacity: 0;
+  transition: opacity 150ms var(--ease);
+  pointer-events: none;
+}
+
+.card-menu button:hover::before,
+.card-menu button:focus-visible::before {
+  opacity: 1;
+}
+
+.card-menu button:hover,
+.card-menu button:focus-visible {
+  padding-left: 13px;
+  color: var(--tg-text);
+}
+
+.card-menu button:active {
+  background: color-mix(in srgb, var(--tg-accent) 16%, var(--tg-hover));
+}
+
+.card-menu button:focus-visible {
+  outline-offset: -2px;
+}
+
+.card-menu button .tp-icon {
+  position: relative;
+  transition:
+    color 150ms var(--ease),
+    transform 180ms var(--ease);
+}
+
+.card-menu button:hover .tp-icon,
+.card-menu button:focus-visible .tp-icon {
+  color: var(--tg-accent);
+  transform: scale(1.12);
+}
+
+.card-menu button.danger-text:hover,
+.card-menu button.danger-text:focus-visible {
+  color: var(--tg-red);
+}
+
+.card-menu button.danger-text::before {
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--tg-red) 20%, transparent),
+    transparent 72%
+  );
+}
+
+.card-menu button.danger-text:hover .tp-icon,
+.card-menu button.danger-text:focus-visible .tp-icon {
+  color: var(--tg-red);
+}
+
+.menu-divider {
+  animation: fade-in 180ms var(--ease) 110ms backwards;
+}
+
+@keyframes menu-item-in {
+  from {
+    opacity: 0;
+    transform: translateX(-7px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+/* El men� de ordenar comparte el mismo lenguaje que el contextual. */
+.sort-menu button {
+  transition:
+    background 130ms var(--ease),
+    color 130ms var(--ease),
+    transform 130ms var(--ease);
+}
+
+.sort-menu button:hover {
+  transform: translateX(2px);
+}
+
+/* =========================================================
+   Piezas nuevas: paginaci�n, portadas e importaciones
+   ========================================================= */
+
+.library-more {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  margin: 26px auto 10px;
+  padding: 18px 16px;
+  border-radius: 14px;
+  border: 1px dashed color-mix(in srgb, var(--tg-divider) 92%, transparent);
+  background: color-mix(in srgb, var(--tg-card-bg) 55%, transparent);
+  text-align: center;
+}
+
+.library-more .btn {
+  gap: 7px;
+}
+
+.library-more-hint {
+  max-width: 430px;
+  color: var(--tg-text-secondary);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+.settings-hint {
+  margin: 0;
+  color: var(--tg-text-secondary);
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+.import-item-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+
+.import-retry {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 26px;
+  padding: 0 9px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--tg-accent) 14%, transparent);
+  color: var(--tg-accent);
+  font-size: 11.5px;
+  font-weight: 600;
+  transition:
+    background 140ms var(--ease),
+    transform 140ms var(--ease);
+}
+
+.import-retry:hover {
+  background: color-mix(in srgb, var(--tg-accent) 22%, transparent);
+  transform: translateY(-1px);
+}
+
+.import-retry:active {
+  transform: scale(0.96);
+}
+
+.import-item {
+  transition: background 140ms var(--ease);
+}
+
+.import-item:hover {
+  background: color-mix(in srgb, var(--tg-hover) 70%, transparent);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .video-card,
+  .video-card:hover,
+  .video-card:active,
+  .icon-btn,
+  .icon-btn:hover,
+  .icon-btn:active,
+  .card-menu,
+  .card-menu.above,
+  .card-menu button,
+  .card-menu button::before,
+  .card-menu button .tp-icon,
+  .card-menu-btn,
+  .card-menu-btn:hover,
+  .video-card .cover-image,
+  .video-card:hover .cover-image,
+  .video-card .cover-shade,
+  .video-card .card-play,
+  .card-play .tp-icon,
+  .sort-menu button,
+  .import-item,
+  .import-retry {
+    transition: none !important;
+    animation: none !important;
+    transform: none !important;
   }
 }

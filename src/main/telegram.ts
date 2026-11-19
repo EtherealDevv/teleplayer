@@ -5,15 +5,16 @@ import bigInt from 'big-integer'
 import { app } from 'electron'
 import fs from 'node:fs'
 import path from 'node:path'
-import { finished } from 'node:stream/promises'
 import { randomUUID } from 'node:crypto'
 import type {
   AuthState,
   AuthUser,
   CacheInfo,
+  CoverRebuildResult,
   DownloadProgress,
   Folder,
   FolderInput,
+  ImportBatchResult,
   ImportProgress,
   Library,
   PlaybackOpenResult,
@@ -36,17 +37,35 @@ import {
   videoCaption
 } from './caption'
 import { errorText } from './errors'
-import { probeVideo } from './media'
+import { scanVideoFolder, statSafe } from './folder-import'
+import { fingerprintFile, type FileFingerprint } from './fingerprint'
+import { generateCover, probeVideo } from './media'
 import { parseRange } from './protocol'
 import { fetchStreamRangeFromParts } from './stream-range'
 import { MediaStreamer, type StreamSource } from './streaming'
-import { downloadPartToStream, fileLimitFor, uploadRange } from './transfer'
+import { fileLimitFor, uploadRange } from './transfer'
 
 const CHANNEL_TITLE = 'TelePlayer · Videoteca'
 const CHANNEL_ABOUT = 'Videoteca de TelePlayer. Los vídeos se guardan aquí como backup en Telegram. No borres este canal ni sus mensajes.'
-const HISTORY_LIMIT = 1500
+const PAGE_SIZE = 400
 const MEDIA_URL = 'tp-media://video/'
 const THUMB_URL = 'tp-media://thumb/'
+/** Dos archivos a la vez: el pool de subida ya reparte cada uno entre 8 sesiones. */
+const IMPORT_CONCURRENCY = 2
+/** Portadas que se generan en segundo plano para vídeos ya copiados al PC. */
+const COVER_BATCH = 2
+/** Bytes que se piden para intentar una portada de un vídeo que solo vive en Telegram. */
+const COVER_HEAD_BYTES = 8 * 1024 * 1024
+/** Colchón de la vista previa del ratón: 2 MB bastan para 10 s de vídeo. */
+const PREVIEW_PREFETCH_BYTES = 2 * 1024 * 1024
+
+interface ImportTask {
+  jobId: string
+  file: string
+  folderId: string | null
+  relativeDir: string
+  fingerprint?: FileFingerprint
+}
 
 interface StoredPart {
   messageId: number
@@ -94,6 +113,29 @@ function cleanPhone(phone: string): string {
   return phone.replace(/[^\d+]/g, '')
 }
 
+const FOLDER_COLORS = [
+  '#3390EC',
+  '#6750A4',
+  '#00897B',
+  '#E91E63',
+  '#FB8C00',
+  '#7E57C2',
+  '#43A047',
+  '#F4511E'
+]
+
+/**
+ * Color estable por nombre, para que una carpeta creada al soltar un
+ * directorio no salga siempre del mismo color.
+ */
+function folderColorFor(name: string): string {
+  let hash = 0
+  for (let index = 0; index < name.length; index += 1) {
+    hash = (hash * 31 + name.charCodeAt(index)) % 9973
+  }
+  return FOLDER_COLORS[hash % FOLDER_COLORS.length]
+}
+
 function pickThumb(message: Api.Message): Api.PhotoSize | undefined {
   const thumbs = message.document?.thumbs
   if (!thumbs || thumbs.length === 0) return undefined
@@ -126,19 +168,40 @@ export class TelegramService {
   private videoIndex = new Map<string, InternalVideo>()
   private thumbQueue: string[] = []
   private thumbBusy = new Set<string>()
-  private importQueue: Promise<void> = Promise.resolve()
+  private coverQueue: Array<{ videoId: string; file: string }> = []
+  private coverTried = new Set<string>()
+  private coverBusy = 0
+  private coverRebuilding = false
+  private importTasks: ImportTask[] = []
+  private importRunning = 0
   private importJobs = new Map<string, ImportProgress>()
+  private importTaskById = new Map<string, ImportTask>()
+  private importControllers = new Map<string, AbortController>()
   private activeImports = 0
   private downloadJobs = new Map<string, DownloadJob>()
   private streamSources = new Map<string, Promise<StreamSource>>()
   private streamer: MediaStreamer
   private lastThumbRefresh = 0
   private activeVideoId: string | null = null
+  /** Id del mensaje más antiguo cargado; next page asks for older ones. */
+  private libraryCursor: number | undefined
+  /** Rango de mensajes ya cargado: el más antiguo del índice y si queda cola. */
+  private libraryHasMore = false
 
   constructor(store: AppStore, events: ServiceEvents) {
     this.store = store
     this.events = events
-    this.streamer = new MediaStreamer(store.cacheDir, (state) => this.events.streamProgress(state))
+    this.streamer = new MediaStreamer(
+      store.cacheDir,
+      (state) => this.events.streamProgress(state),
+      {
+        onPartial: (videoId, filePath) => {
+          // Los bloques que quedan al cerrar una sesión sirven para sacar la
+          // portada de un vídeo que solo está en Telegram.
+          this.queueCover(videoId, filePath)
+        }
+      }
+    )
     const credentials = store.getCredentialInfo()
     const configured = Boolean(credentials.apiId && credentials.apiHash)
     this.auth = {
@@ -436,7 +499,21 @@ export class TelegramService {
           deviceModel: 'TelePlayer Desktop',
           systemVersion: `${process.platform} ${process.getSystemVersion?.() ?? ''}`.trim(),
           appVersion: app.getVersion(),
-          langCode: 'es'
+          langCode: 'es',
+          // El MediaScheduler de teleproto reparte cada archivo entre varias
+          // conexiones al DC de medios. Los valores por defecto (4 sesiones ×
+          // 4 partes de 512 KB = 8 MB en vuelo) dejan la mayor parte del ancho
+          // de banda sin usar en enlaces rápidos; 8 × 4 duplica esa ventana sin
+          // salirse de lo que hacen los clientes oficiales. Telegram limita
+          // las sesiones de subida a 4 en los DC 2 y 4, así que ahí la ventana
+          // efectiva es 4 × 4 × 512 KB = 8 MB.
+          downloadPool: {
+            partSize: 512 * 1024,
+            requestRetries: 6,
+            requestDeadlineMs: 20_000,
+            download: { partSize: 512 * 1024, sessions: 8, inFlight: 4 },
+            upload: { partSize: 512 * 1024, sessions: 8, inFlight: 4 }
+          }
         }
       )
       this.client = client
@@ -599,17 +676,87 @@ export class TelegramService {
     const peer = await this.ensureChannel()
     const client = await this.connect()
 
-    const messages: Api.Message[] = []
-    for await (const message of client.iterMessages(peer, { limit: HISTORY_LIMIT, waitTime: 0 })) {
-      if (message instanceof Api.Message) messages.push(message)
-      if (messages.length >= HISTORY_LIMIT) break
-    }
+    // Primera página del historial, de lo más nuevo a lo más antiguo. Antes se
+    // pedían 1500 mensajes en cada arranque; con 400 la biblioteca aparece
+    // antes y el resto se pide al pulsar «Cargar más».
+    this.videoIndex = new Map()
+    this.libraryCursor = undefined
+    this.libraryHasMore = true
+    await this.loadPage(client, peer)
+    this.folders = await this.loadFolders(
+      peer,
+      [...this.videoIndex.values()].map((video) => video.meta)
+    )
+    this.queueThumbnails()
+    this.queueLocalCovers()
+    return this.buildLibrary()
+  }
 
+  /** Siguiente página del historial, fundida con lo que ya había. */
+  async loadMore(): Promise<Library> {
+    await this.requireAuthorized()
+    if (!this.videoIndex.size) return this.listLibrary()
+    if (this.libraryHasMore) {
+      const client = await this.connect()
+      const peer = await this.ensureChannel()
+      await this.loadPage(client, peer)
+    }
+    return this.buildLibrary()
+  }
+
+  /**
+   * Pide la página anterior a `libraryCursor` y la funde con lo cargado. El
+   * cursor es el id más antiguo visto y `offsetId` es exclusivo, así que cada
+   * página empieza justo detrás de la anterior sin repetir mensajes.
+   */
+  private async loadPage(
+    client: TelegramClient,
+    peer: Api.InputPeerChannel
+  ): Promise<boolean> {
+    const page = await this.fetchMessages(client, peer, this.libraryCursor)
+    if (page.length === 0) {
+      this.libraryHasMore = false
+      this.pruneOrphanThumbs()
+      return false
+    }
+    let oldest = Number.POSITIVE_INFINITY
+    for (const message of page) oldest = Math.min(oldest, message.id)
+    if (Number.isFinite(oldest)) this.libraryCursor = oldest
+    this.libraryHasMore = page.length >= PAGE_SIZE
+    this.mergePage(page)
+    this.rememberFolders()
+    this.queueThumbnails()
+    this.queueLocalCovers()
+    // Con el historial completo el índice es la biblioteca real: las portadas
+    // que sobran son de vídeos borrados o de importaciones que no entraron.
+    if (!this.libraryHasMore) this.pruneOrphanThumbs()
+    return true
+  }
+
+  private async fetchMessages(
+    client: TelegramClient,
+    peer: Api.InputPeerChannel,
+    offsetId?: number
+  ): Promise<Api.Message[]> {
+    const page: Api.Message[] = []
+    for await (const message of client.iterMessages(peer, {
+      limit: PAGE_SIZE,
+      offsetId: offsetId ?? 0,
+      waitTime: 0
+    })) {
+      if (message instanceof Api.Message) page.push(message)
+      if (page.length >= PAGE_SIZE) break
+    }
+    return page
+  }
+
+  /** Funde una página de mensajes con el índice, sin duplicar partes. */
+  private mergePage(page: Api.Message[]): void {
     const grouped = new Map<
       string,
       { metas: StoredMeta[]; parts: StoredPart[]; thumbType?: string }
     >()
-    for (const message of messages) {
+    for (const message of page) {
       const document = message.document
       if (!document) continue
       const meta = parseVideoCaption(message.text)
@@ -625,30 +772,93 @@ export class TelegramService {
       grouped.set(meta.id, entry)
     }
 
-    const nextIndex = new Map<string, InternalVideo>()
     for (const [id, entry] of grouped) {
-      entry.parts.sort((a, b) => a.part - b.part)
+      const existing = this.videoIndex.get(id)
+      const parts: StoredPart[] = []
+      const seen = new Set<number>()
+      for (const part of [...(existing?.parts ?? []), ...entry.parts]) {
+        if (seen.has(part.messageId)) continue
+        seen.add(part.messageId)
+        parts.push(part)
+      }
+      parts.sort((a, b) => a.part - b.part)
       const primary =
         entry.metas.find((meta) => meta.part === 0) ??
+        existing?.meta ??
         [...entry.metas].sort((a, b) => a.part - b.part)[0]
       if (!primary) continue
-      const partCount = Math.max(primary.parts, entry.parts.length)
-      const size = primary.size || entry.parts.reduce((sum, part) => sum + part.size, 0)
-      nextIndex.set(id, {
-        meta: {
-          ...primary,
-          parts: partCount,
-          size
-        },
-        parts: entry.parts,
-        thumbType: entry.thumbType
+      const partCount = Math.max(primary.parts, parts.length)
+      const size = primary.size || parts.reduce((sum, part) => sum + part.size, 0)
+      this.videoIndex.set(id, {
+        meta: { ...primary, parts: partCount, size },
+        parts,
+        thumbType: entry.thumbType ?? existing?.thumbType
       })
     }
-    this.videoIndex = nextIndex
+  }
 
-    this.folders = await this.loadFolders(peer, [...nextIndex.values()].map((video) => video.meta))
-    this.queueThumbnails()
-    return this.buildLibrary()
+  /** Carpetas que solo aparecen en una página antigua del historial. */
+  private rememberFolders(): void {
+    const current = this.folders ?? []
+    const byId = new Map(current.map((folder) => [folder.id, folder]))
+    let added = false
+    for (const video of this.videoIndex.values()) {
+      const { folderId, folderName, addedAt } = video.meta
+      if (!folderId || byId.has(folderId)) continue
+      byId.set(folderId, {
+        id: folderId,
+        name: folderName || 'Carpeta',
+        emoji: '🎬',
+        color: '#3390EC',
+        createdAt: addedAt
+      })
+      added = true
+    }
+    if (!added) return
+    this.folders = [...byId.values()].sort((a, b) => a.createdAt - b.createdAt)
+    this.store.setFoldersCache(this.folders)
+  }
+
+  /**
+   * Portadas sin vídeo cuando el índice está completo. Con paginación hay que
+   * esperar a la última página: antes de eso el índice no es la biblioteca.
+   */
+  private pruneOrphanThumbs(): void {
+    if (this.libraryHasMore) return
+    const removed = this.store.pruneThumbs(new Set(this.videoIndex.keys()))
+    if (removed > 0) console.info(`Portadas huérfanas borradas: ${removed}`)
+  }
+
+  /**
+   * Deja el vídeo en el índice aunque viva en una página antigua: pide páginas
+   * hasta encontrarlo. Sin esto, un vídeo de hace meses no se podría abrir ni
+   * borrar sin pulsar «Cargar más» a mano.
+   */
+  private async ensureIndexed(videoId: string): Promise<InternalVideo | undefined> {
+    if (!this.videoIndex.size) await this.listLibrary()
+    let found = this.videoIndex.get(videoId)
+    while (!found && this.libraryHasMore) {
+      const client = await this.connect()
+      const peer = await this.ensureChannel()
+      const advanced = await this.loadPage(client, peer)
+      if (!advanced) break
+      found = this.videoIndex.get(videoId)
+    }
+    return found
+  }
+
+  /**
+   * Carga el historial entero. Solo lo usan operaciones que tienen que tocar
+   * todos los vídeos a la vez (borrar una carpeta con sus captions).
+   */
+  private async loadAllPages(): Promise<void> {
+    let guard = 0
+    while (this.libraryHasMore && guard < 500) {
+      guard += 1
+      const client = await this.connect()
+      const peer = await this.ensureChannel()
+      if (!(await this.loadPage(client, peer))) break
+    }
   }
 
   private buildLibrary(): Library {
@@ -684,6 +894,7 @@ export class TelegramService {
       videos,
       channelTitle: this.store.channel?.title ?? CHANNEL_TITLE,
       totalSize: videos.reduce((sum, video) => sum + video.size, 0),
+      hasMore: this.libraryHasMore,
       user: this.auth.user
     }
   }
@@ -823,6 +1034,10 @@ export class TelegramService {
     if (this.activeImports > 0) {
       throw new Error('Espera a que terminen las importaciones antes de eliminar una carpeta.')
     }
+    // Borrar una carpeta es raro y tiene que alcanzar también a los vídeos de
+    // páginas antiguas: si no, sus captions seguirían apuntando a una carpeta
+    // que ya no existe y `rememberFolders` la resucitaría al cargar más.
+    await this.loadAllPages()
     const existing = await this.currentFolders()
     if (!existing.some((folder) => folder.id === folderId)) return this.buildLibrary()
     const affected = [...this.videoIndex.values()].filter(
@@ -840,8 +1055,7 @@ export class TelegramService {
 
   async moveVideo(videoId: string, folderId: string | null): Promise<void> {
     await this.requireAuthorized()
-    if (!this.videoIndex.size) await this.listLibrary()
-    const video = this.videoIndex.get(videoId)
+    const video = await this.ensureIndexed(videoId)
     if (!video) throw new Error('Ese vídeo ya no está en la biblioteca.')
     const folders = await this.currentFolders()
     const folder = folderId ? folders.find((item) => item.id === folderId) : undefined
@@ -855,8 +1069,7 @@ export class TelegramService {
 
   async renameVideo(videoId: string, titleRaw: string): Promise<void> {
     await this.requireAuthorized()
-    if (!this.videoIndex.size) await this.listLibrary()
-    const video = this.videoIndex.get(videoId)
+    const video = await this.ensureIndexed(videoId)
     if (!video) throw new Error('Ese vídeo ya no está en la biblioteca.')
     const title = normalizeTitle(titleRaw)
     if (!title) throw new Error('El título no puede estar vacío.')
@@ -885,8 +1098,7 @@ export class TelegramService {
 
   async deleteVideo(videoId: string): Promise<void> {
     await this.requireAuthorized()
-    if (!this.videoIndex.size) await this.listLibrary()
-    const video = this.videoIndex.get(videoId)
+    const video = await this.ensureIndexed(videoId)
     if (!video) return
     const job = this.downloadJobs.get(videoId)
     if (job) {
@@ -905,6 +1117,7 @@ export class TelegramService {
     await this.streamer.remove(videoId)
     this.streamSources.delete(videoId)
     this.store.removeCache(videoId)
+    this.store.removePartialCache(videoId)
     this.store.removeWatch(videoId)
     this.events.libraryChanged()
   }
@@ -969,48 +1182,432 @@ export class TelegramService {
     }
   }
 
-  queueImport(paths: string[], folderId: string | null): number {
-    const valid = paths.filter((file) => {
-      try {
-        const stat = fs.statSync(file)
-        return stat.isFile() && isVideoFileName(file)
-      } catch {
-        return false
-      }
-    })
-    for (const file of valid) {
-      this.activeImports += 1
-      this.importQueue = this.importQueue
-        .then(() => this.importFile(file, folderId))
-        .catch((error) => {
-          console.error('Error importando', file, error)
-        })
-        .finally(() => {
-          this.activeImports = Math.max(0, this.activeImports - 1)
-        })
+  /**
+   * Portada a partir del primer fotograma del archivo local. Solo aplica a
+   * vídeos ya descargados al PC o con bloques en la caché progresiva: los que
+   * viven solo en Telegram dependen del `thumb` del servidor o de que se
+   * reproduzcan una vez.
+   */
+  private queueLocalCovers(): void {
+    for (const [id] of this.videoIndex) {
+      const file = this.store.getCacheFile(id)
+      if (file) this.queueCover(id, file)
     }
-    return valid.length
   }
 
-  private async importFile(file: string, folderId: string | null): Promise<void> {
-    const stat = fs.statSync(file)
-    const name = path.basename(file)
-    const job: ImportProgress = {
-      jobId: randomUUID(),
+  private queueCover(videoId: string, file: string): void {
+    if (this.coverTried.has(videoId)) return
+    if (this.store.hasThumb(videoId)) return
+    if (this.coverQueue.some((item) => item.videoId === videoId)) return
+    this.coverQueue.push({ videoId, file })
+    this.pumpCovers()
+  }
+
+  private pumpCovers(): void {
+    while (this.coverBusy < COVER_BATCH && this.coverQueue.length > 0) {
+      const task = this.coverQueue.shift()
+      if (!task) break
+      const { videoId, file } = task
+      if (this.coverTried.has(videoId)) continue
+      const thumbPath = this.store.getThumbPath(videoId)
+      if (!thumbPath || this.store.hasThumb(videoId)) continue
+      // Un vídeo se intenta una sola vez por sesión: si ffmpeg no está o el
+      // archivo no se deja leer, no se reintenta en cada refresco de la
+      // biblioteca.
+      this.coverTried.add(videoId)
+      this.coverBusy += 1
+      void generateCover(file, thumbPath)
+        .then((generated) => {
+          if (generated && this.store.hasThumb(videoId)) {
+            this.events.thumb({ videoId, url: `${THUMB_URL}${videoId}` })
+          }
+        })
+        .finally(() => {
+          this.coverBusy = Math.max(0, this.coverBusy - 1)
+          this.pumpCovers()
+        })
+    }
+  }
+
+  /**
+   * Regenera las portadas que falten. Para los vídeos con copia local usa el
+   * archivo; para los que solo están en Telegram descarga la cabecera (8 MB)
+   * a un temporal y prueba con ella, que funciona en los formatos con el índice
+   * al principio. Es una acción manual: recorre la biblioteca entera.
+   */
+  async rebuildCovers(): Promise<CoverRebuildResult> {
+    await this.requireAuthorized()
+    if (this.videoIndex.size === 0) await this.listLibrary()
+    if (this.coverRebuilding) return { total: 0, generated: 0, failed: 0 }
+    this.coverRebuilding = true
+    const targets = [...this.videoIndex.keys()].filter((id) => !this.store.hasThumb(id))
+    let generated = 0
+    let failed = 0
+    try {
+      for (const videoId of targets) {
+        this.coverTried.delete(videoId)
+        const cached = this.store.getCacheFile(videoId)
+        if (cached) {
+          const thumbPath = this.store.getThumbPath(videoId)
+          if (thumbPath && (await generateCover(cached, thumbPath))) {
+            generated += 1
+            this.events.thumb({ videoId, url: `${THUMB_URL}${videoId}` })
+          } else {
+            failed += 1
+          }
+          continue
+        }
+        if (await this.headCover(videoId)) {
+          generated += 1
+          this.events.thumb({ videoId, url: `${THUMB_URL}${videoId}` })
+        } else {
+          failed += 1
+        }
+      }
+    } finally {
+      this.coverRebuilding = false
+    }
+    return { total: targets.length, generated, failed }
+  }
+
+  /** Portada a partir de los primeros megabytes de un vídeo que solo está en Telegram. */
+  private async headCover(videoId: string): Promise<boolean> {
+    const internal = this.videoIndex.get(videoId)
+    const thumbPath = this.store.getThumbPath(videoId)
+    if (!internal || !thumbPath) return false
+    const temp = path.join(this.store.cacheDir, `.cover-${videoId}.part`)
+    try {
+      const client = await this.connect()
+      const { parts, totalSize } = await this.loadParts(internal, client)
+      const first = parts[0]
+      if (!first) return false
+      const length = Math.min(COVER_HEAD_BYTES, totalSize, first.size)
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), 90_000)
+      try {
+        const buffer = await this.fetchStreamRange(client, parts, 0, length, controller.signal)
+        await fs.promises.writeFile(temp, buffer)
+      } finally {
+        clearTimeout(timer)
+      }
+      const ok = await generateCover(temp, thumbPath)
+      return ok && this.store.hasThumb(videoId)
+    } catch {
+      // Un MP4 con el índice al final no se deja leer a medias: se queda sin
+      // portada hasta que exista una copia completa.
+      return false
+    } finally {
+      await fs.promises.rm(temp, { force: true }).catch(() => undefined)
+    }
+  }
+
+  /**
+   * Crea (o reutiliza) una carpeta de la biblioteca con ese nombre. Se usa al
+   * soltar un directorio: la carpeta del disco se convierte en una carpeta de
+   * TelePlayer con el mismo nombre.
+   */
+  private async ensureFolderByName(
+    rawName: string
+  ): Promise<{ folder: Folder; created: boolean }> {
+    const name = (rawName || 'Carpeta').trim().slice(0, 48) || 'Carpeta'
+    const existing = await this.currentFolders()
+    const found = existing.find((folder) => folder.name.toLowerCase() === name.toLowerCase())
+    if (found) return { folder: found, created: false }
+    const folder: Folder = {
+      id: randomUUID(),
+      name,
+      emoji: '🎬',
+      color: folderColorFor(name),
+      createdAt: Date.now()
+    }
+    const folders = [...existing, folder]
+    const peer = await this.ensureChannel()
+    await this.saveFolders(peer, folders)
+    this.folders = folders
+    return { folder, created: true }
+  }
+
+  /** Clave nombre+tamaño para no volver a subir lo que ya está en Telegram. */
+  private libraryKey(name: string, size: number): string {
+    return `${name.toLowerCase()}|${size}`
+  }
+
+  private libraryKeys(): Set<string> {
+    const keys = new Set<string>()
+    for (const [, video] of this.videoIndex) {
+      keys.add(this.libraryKey(video.meta.n, video.meta.size))
+    }
+    return keys
+  }
+
+  async queueImport(paths: string[], folderId: string | null): Promise<number> {
+    await this.requireAuthorized()
+    // Sin índice cargado no hay forma de reconocer un vídeo ya subido.
+    if (this.videoIndex.size === 0) await this.listLibrary()
+    const known = this.libraryKeys()
+    const knownHashes = this.store.fingerprintIndex()
+    let queued = 0
+    for (const file of paths) {
+      try {
+        const stat = fs.statSync(file)
+        if (!stat.isFile() || !isVideoFileName(file)) continue
+        const key = this.libraryKey(path.basename(file), stat.size)
+        if (known.has(key)) continue
+        known.add(key)
+        const fingerprint = await fingerprintFile(file)
+        if (fingerprint && knownHashes.has(fingerprint.hash)) continue
+        if (fingerprint) knownHashes.set(fingerprint.hash, 'batch')
+        this.enqueueFile(file, folderId, '', stat.size, fingerprint ?? undefined)
+        queued += 1
+      } catch {
+        // La ruta desapareció entre el diálogo y la cola.
+      }
+    }
+    return queued
+  }
+
+  /**
+   * Importa rutas del sistema: los archivos de vídeo van a `folderId` y cada
+   * carpeta se convierte en una carpeta nueva de la biblioteca. También se usa
+   * desde el arrastrar y soltar del renderer.
+   */
+  async queueImportPaths(paths: string[], folderId: string | null): Promise<ImportBatchResult> {
+    await this.requireAuthorized()
+    await this.currentFolders()
+    if (this.videoIndex.size === 0) await this.listLibrary()
+    let videos = 0
+    let folders = 0
+    let ignored = 0
+    let duplicates = 0
+    const known = this.libraryKeys()
+    const knownHashes = this.store.fingerprintIndex()
+    const seen = new Set<string>()
+
+    const accept = async (
+      file: string,
+      stat: fs.Stats,
+      targetFolder: string | null,
+      relativeDir = ''
+    ): Promise<void> => {
+      const key = this.libraryKey(path.basename(file), stat.size)
+      if (known.has(key)) {
+        duplicates += 1
+        return
+      }
+      // Segundo cerco: un archivo renombrado (o el mismo vídeo recodificado
+      // sin cambiar tamaño) no coincide por nombre, sí por contenido.
+      const fingerprint = await fingerprintFile(file)
+      if (fingerprint && knownHashes.has(fingerprint.hash)) {
+        duplicates += 1
+        return
+      }
+      known.add(key)
+      if (fingerprint) knownHashes.set(fingerprint.hash, 'batch')
+      this.enqueueFile(file, targetFolder, relativeDir, stat.size, fingerprint ?? undefined)
+      videos += 1
+    }
+
+    for (const raw of paths) {
+      const target = String(raw ?? '').trim()
+      if (!target) {
+        ignored += 1
+        continue
+      }
+      const stat = await statSafe(target)
+      if (!stat) {
+        ignored += 1
+        continue
+      }
+      if (stat.isFile()) {
+        if (!isVideoFileName(target)) {
+          ignored += 1
+          continue
+        }
+        const key = path.resolve(target).toLowerCase()
+        if (seen.has(key)) continue
+        seen.add(key)
+        await accept(target, stat, folderId)
+        continue
+      }
+      if (!stat.isDirectory()) {
+        ignored += 1
+        continue
+      }
+
+      const scan = await scanVideoFolder(target)
+      ignored += scan.ignored
+      if (scan.files.length === 0) continue
+      const { folder, created } = await this.ensureFolderByName(path.basename(target))
+      if (created) folders += 1
+      for (const entry of scan.files) {
+        const key = path.resolve(entry.file).toLowerCase()
+        if (seen.has(key)) continue
+        seen.add(key)
+        const entryStat = await statSafe(entry.file)
+        if (!entryStat) {
+          ignored += 1
+          continue
+        }
+        await accept(entry.file, entryStat, folder.id, entry.relativeDir)
+      }
+    }
+
+    if (folders > 0) this.events.libraryChanged()
+    return { videos, folders, ignored, duplicates }
+  }
+
+  /** Crea la ficha visible del trabajo, congelada antes de arrancar. */
+  private createImportJob(task: ImportTask, size: number): ImportProgress {
+    const name = path.basename(task.file)
+    const nested = task.relativeDir
+      ? task.relativeDir
+          .split(/[\\/]+/)
+          .filter(Boolean)
+          .join(' · ')
+      : ''
+    return {
+      jobId: task.jobId,
       videoId: randomUUID(),
       name,
-      title: titleFromFileName(name),
-      folderId,
-      size: stat.size,
+      title: normalizeTitle(
+        nested ? `${nested} · ${titleFromFileName(name)}` : titleFromFileName(name)
+      ),
+      folderId: task.folderId,
+      size,
       partIndex: 0,
-      partCount: Math.max(1, Math.ceil(stat.size / fileLimitFor(this.me?.premium))),
+      partCount: Math.max(1, Math.ceil(size / fileLimitFor(this.me?.premium))),
       uploadedBytes: 0,
-      totalBytes: stat.size,
+      totalBytes: size,
       speed: 0,
-      status: 'preparing',
-      detail: 'Analizando el vídeo…'
+      status: 'queued',
+      detail: 'En espera…'
     }
-    this.importJobs.set(job.jobId, job)
+  }
+
+  private enqueueFile(
+    file: string,
+    folderId: string | null,
+    relativeDir = '',
+    size?: number,
+    fingerprint?: FileFingerprint
+  ): void {
+    let fileSize = size
+    if (fileSize === undefined) {
+      try {
+        fileSize = fs.statSync(file).size
+      } catch {
+        return
+      }
+    }
+    const task: ImportTask = {
+      jobId: randomUUID(),
+      file,
+      folderId,
+      relativeDir,
+      fingerprint
+    }
+    const job = this.createImportJob(task, fileSize)
+    this.importJobs.set(task.jobId, job)
+    this.importTaskById.set(task.jobId, task)
+    this.importTasks.push(task)
+    this.activeImports += 1
+    this.emitImport(job)
+    this.pumpImports()
+  }
+
+  /**
+   * La cola mantiene dos importaciones a la vez: el pool de subida ya reparte
+   * cada archivo entre varias sesiones, y con una sola la biblioteca se queda
+   * esperando en una carpeta de clips cortos. Los archivos siguen en orden.
+   */
+  private pumpImports(): void {
+    while (this.importRunning < IMPORT_CONCURRENCY && this.importTasks.length > 0) {
+      const task = this.importTasks.shift()
+      if (!task) break
+      const job = this.importJobs.get(task.jobId)
+      if (!job || job.status === 'cancelled') {
+        this.activeImports = Math.max(0, this.activeImports - 1)
+        continue
+      }
+      this.importRunning += 1
+      void this.importFile(task)
+        .catch((error) => {
+          console.error('Error importando', task.file, error)
+        })
+        .finally(() => {
+          this.importRunning = Math.max(0, this.importRunning - 1)
+          this.activeImports = Math.max(0, this.activeImports - 1)
+          this.pumpImports()
+        })
+    }
+  }
+
+  /** Fichas vivas: el renderer las pide al arrancar para no perder el progreso. */
+  imports(): ImportProgress[] {
+    return [...this.importJobs.values()]
+      .map((job) => ({ ...job }))
+      .sort((a, b) => a.jobId.localeCompare(b.jobId))
+  }
+
+  /**
+   * Cancela una importación. Si ya está subiendo se aborta la señal que leen
+   * `uploadRange` y las esperas; si sigue en cola, se quita sin arrancar.
+   */
+  cancelImport(jobId: string): void {
+    const job = this.importJobs.get(jobId)
+    if (!job || job.status === 'done' || job.status === 'cancelled') return
+    const controller = this.importControllers.get(jobId)
+    if (controller) {
+      controller.abort()
+      return
+    }
+    const index = this.importTasks.findIndex((task) => task.jobId === jobId)
+    if (index >= 0) {
+      this.importTasks.splice(index, 1)
+      this.activeImports = Math.max(0, this.activeImports - 1)
+    }
+    job.status = 'cancelled'
+    job.speed = 0
+    job.detail = 'Cancelado'
+    job.error = undefined
+    this.emitImport(job)
+  }
+
+  /** Reencola un trabajo fallido o cancelado con la misma ficha. */
+  retryImport(jobId: string): void {
+    const job = this.importJobs.get(jobId)
+    const task = this.importTaskById.get(jobId)
+    if (!job || !task) throw new Error('Ese trabajo ya no existe.')
+    if (job.status !== 'error' && job.status !== 'cancelled') return
+    job.status = 'queued'
+    job.videoId = randomUUID()
+    job.uploadedBytes = 0
+    job.partIndex = 0
+    job.speed = 0
+    job.error = undefined
+    job.detail = 'En espera…'
+    this.emitImport(job)
+    this.importTasks.push(task)
+    this.activeImports += 1
+    this.pumpImports()
+  }
+
+  private async importFile(task: ImportTask): Promise<void> {
+    const { file } = task
+    const name = path.basename(file)
+    const job = this.importJobs.get(task.jobId)
+    if (!job) return
+    const controller = new AbortController()
+    const { signal } = controller
+    this.importControllers.set(task.jobId, controller)
+    const cancelled = (): boolean => signal.aborted
+    const abortIfCancelled = (): void => {
+      if (signal.aborted) throw new Error('UPLOAD_CANCELLED')
+    }
+    const stat = fs.statSync(file)
+    job.status = 'preparing'
+    job.detail = 'Analizando el vídeo…'
+    job.partCount = Math.max(1, Math.ceil(stat.size / fileLimitFor(this.me?.premium)))
     this.emitImport(job)
 
     let peer: Api.InputPeerChannel | null = null
@@ -1020,14 +1617,37 @@ export class TelegramService {
       const client = await this.connect()
       peer = await this.ensureChannel()
       const folders = await this.currentFolders()
-      const folder = folderId ? folders.find((item) => item.id === folderId) : undefined
+      const folder = task.folderId
+        ? folders.find((item) => item.id === task.folderId)
+        : undefined
       const probe = await probeVideo(file)
+      abortIfCancelled()
       const mime = mimeForName(name)
       const ext = extensionFromFileName(name).toLowerCase()
       const fileLimit = fileLimitFor(this.me?.premium)
       const parts = Math.max(1, Math.ceil(stat.size / fileLimit))
       const supportsStreaming = ['.mp4', '.m4v', '.mov', '.webm'].includes(ext)
       job.partCount = parts
+      job.detail = parts > 1 ? `Generando la portada · ${parts} partes` : 'Generando la portada…'
+      this.emitImport(job)
+
+      // Portada: fotograma del archivo local. Se guarda en la caché de
+      // miniaturas para que la tarjeta la muestre al instante y se sube como
+      // `thumb` para que el mensaje de Telegram también la lleve.
+      const thumbPath = this.store.getThumbPath(job.videoId)
+      if (thumbPath && !this.store.hasThumb(job.videoId)) {
+        await generateCover(file, thumbPath)
+      }
+      abortIfCancelled()
+      let thumbSize = 0
+      if (thumbPath) {
+        try {
+          const thumbStat = fs.statSync(thumbPath)
+          if (thumbStat.isFile()) thumbSize = thumbStat.size
+        } catch {
+          // Sin portada el vídeo sigue siendo válido: Telegram enseña su icono.
+        }
+      }
       this.emitImport(job)
 
       let uploadedBefore = 0
@@ -1050,6 +1670,7 @@ export class TelegramService {
       }
 
       for (let part = 0; part < parts; part += 1) {
+        abortIfCancelled()
         const start = part * fileLimit
         const partBytes = Math.min(stat.size - start, fileLimit)
         const partName =
@@ -1103,13 +1724,34 @@ export class TelegramService {
           offset: start,
           length: partBytes,
           name: partName,
+          signal,
           onProgress: (uploaded) => {
             job.uploadedBytes = Math.min(stat.size, uploadedBefore + uploaded)
             emitProgress()
           }
         })
+        abortIfCancelled()
+        // El `file_id` de una subida temporal se reclama al enviar el mensaje,
+        // así que cada parte sube su propia copia de la portada (un JPEG de
+        // unos kilobytes) en lugar de reutilizar la de la parte anterior.
+        let thumbFile: Api.TypeInputFile | undefined
+        if (thumbPath && thumbSize > 0) {
+          try {
+            thumbFile = await uploadRange({
+              client,
+              filePath: thumbPath,
+              offset: 0,
+              length: thumbSize,
+              name: 'portada.jpg',
+              onProgress: () => undefined
+            })
+          } catch {
+            // La portada es decorativa: el vídeo se envía igual.
+          }
+        }
         const media = new Api.InputMediaUploadedDocument({
           file: inputFile,
+          thumb: thumbFile,
           mimeType: mime,
           attributes,
           forceFile: true
@@ -1120,6 +1762,16 @@ export class TelegramService {
           formattingEntities: [],
           silent: true
         })
+        // Si Telegram guardó menos bytes de los enviados, el vídeo quedaría
+        // truncado y los saltos de la barra fallarían: mejor fallar ahora.
+        const document =
+          sent.media instanceof Api.MessageMediaDocument ? sent.media.document : undefined
+        const storedSize = document instanceof Api.Document ? numberOf(document.size) : 0
+        if (storedSize > 0 && storedSize !== partBytes) {
+          throw new Error(
+            `Telegram guardó ${storedSize} de ${partBytes} bytes en una parte. La subida quedó incompleta.`
+          )
+        }
         uploadedIds.push(sent.id)
         uploadedBefore += partBytes
         job.uploadedBytes = Math.min(stat.size, uploadedBefore)
@@ -1130,6 +1782,7 @@ export class TelegramService {
       job.uploadedBytes = stat.size
       job.speed = 0
       job.detail = parts > 1 ? `Guardado en Telegram · ${parts} partes` : 'Guardado en Telegram'
+      if (task.fingerprint) this.store.setFingerprint(job.videoId, task.fingerprint)
       this.emitImport(job)
       this.events.libraryChanged()
     } catch (error) {
@@ -1141,12 +1794,20 @@ export class TelegramService {
           // Leave the partial upload in the channel if cleanup fails.
         }
       }
-      job.status = 'error'
-      job.speed = 0
-      job.error = errorText(error)
+      this.store.removeThumb(job.videoId)
+      if (cancelled()) {
+        job.status = 'cancelled'
+        job.speed = 0
+        job.detail = 'Cancelado'
+        job.error = undefined
+      } else {
+        job.status = 'error'
+        job.speed = 0
+        job.error = errorText(error)
+      }
       this.emitImport(job)
     } finally {
-      setTimeout(() => this.importJobs.delete(job.jobId), 120_000)
+      this.importControllers.delete(task.jobId)
     }
   }
 
@@ -1154,7 +1815,7 @@ export class TelegramService {
     this.events.importProgress({ ...job })
   }
 
-  async open(videoId: string): Promise<PlaybackOpenResult> {
+  async open(videoId: string, preview = false): Promise<PlaybackOpenResult> {
     await this.requireAuthorized()
     const cached = this.store.getCacheFile(videoId)
     if (cached) {
@@ -1165,17 +1826,13 @@ export class TelegramService {
         stream: this.streamer.progress(videoId)
       }
     }
-    if (!this.videoIndex.size) await this.listLibrary()
-    if (!this.videoIndex.has(videoId)) {
-      await this.listLibrary()
+    if (!(await this.ensureIndexed(videoId))) {
+      throw new Error('Ese vídeo ya no está disponible en Telegram.')
     }
-    if (!this.videoIndex.has(videoId)) throw new Error('Ese vídeo ya no está disponible en Telegram.')
-    const existing = this.downloadJobs.get(videoId)
-    if (existing) {
-      if (existing.state.status === 'downloading') {
-        return { cached: false, state: { ...existing.state }, stream: this.streamer.progress(videoId) }
-      }
+    let existing = this.downloadJobs.get(videoId)
+    if (existing && existing.state.status !== 'downloading') {
       this.downloadJobs.delete(videoId)
+      existing = undefined
     }
 
     const previousStream = this.streamer.progress(videoId)
@@ -1184,13 +1841,21 @@ export class TelegramService {
       this.streamSources.delete(videoId)
     }
 
-    // Preparamos la fuente de streaming (una consulta de mensajes, no la
-    // descarga del archivo) para que el primer fotograma llegue cuanto antes.
-    await this.ensureStreamSource(videoId)
+    // La caché progresiva y la descarga completa comparten archivo y bloques:
+    // si ya hay una descarga en marcha, el reproductor se engancha a ella y ve
+    // lo que falta mientras se sigue guardando en segundo plano.
+    const source = await this.ensureStreamSource(videoId)
+    // La vista previa de una tarjeta reproduce unos segundos: con 2 MB por
+    // delante basta y no llena la caché de vídeos que nadie abre. Al abrir el
+    // reproductor se vuelve al colchón calculado por bitrate.
+    this.streamer.setPrefetchBytes(
+      videoId,
+      preview ? PREVIEW_PREFETCH_BYTES : source.prefetchBytes
+    )
     return {
       cached: false,
       url: `${MEDIA_URL}${videoId}`,
-      state: null,
+      state: existing ? { ...existing.state } : null,
       stream: this.streamer.progress(videoId)
     }
   }
@@ -1248,8 +1913,7 @@ export class TelegramService {
     void this.requireAuthorized()
       .then(async () => {
         if (this.store.isCached(videoId)) return
-        if (!this.videoIndex.size) await this.listLibrary()
-        if (!this.videoIndex.has(videoId)) {
+        if (!(await this.ensureIndexed(videoId))) {
           throw new Error('Ese vídeo ya no está disponible en Telegram.')
         }
         const existing = this.downloadJobs.get(videoId)
@@ -1257,10 +1921,9 @@ export class TelegramService {
           if (existing.state.status === 'downloading') return
           this.downloadJobs.delete(videoId)
         }
-        // La descarga completa y el streaming no deben escribir el mismo
-        // archivo a la vez. Si había una caché parcial, se empieza de cero.
-        await this.streamer.remove(videoId)
-        this.streamSources.delete(videoId)
+        // La descarga completa usa la misma caché por bloques que el
+        // streaming: lo que ya se guardó al reproducir no se vuelve a bajar y
+        // un archivo a medias se retoma donde quedó.
         this.startDownload(videoId)
       })
       .catch((error) => {
@@ -1290,34 +1953,7 @@ export class TelegramService {
     const internal = this.videoIndex.get(videoId)
     if (!internal) throw new Error('Ese vídeo ya no está disponible en Telegram.')
     const client = await this.connect()
-    const peer = await this.ensureChannel()
-    const found = await client.getMessages(peer, {
-      ids: internal.parts.map((part) => part.messageId)
-    })
-    const byId = new Map<number, Api.Message>()
-    for (const message of found) {
-      if (message instanceof Api.Message) byId.set(message.id, message)
-    }
-
-    const parts: StreamPartSource[] = []
-    let cursor = 0
-    for (const part of internal.parts) {
-      const message = byId.get(part.messageId)
-      if (!message) throw new Error('Falta una parte del vídeo en Telegram.')
-      const info = getFileInfo(message)
-      if (!info.location) throw new Error('Telegram no devolvió la ubicación del vídeo.')
-      const size = part.size > 0 ? part.size : info.size ? info.size.toJSNumber() : 0
-      if (size <= 0) throw new Error('Una parte del vídeo no tiene tamaño.')
-      parts.push({
-        start: cursor,
-        size,
-        dcId: info.dcId ?? client.session.dcId,
-        location: info.location
-      })
-      cursor += size
-    }
-    if (parts.length === 0) throw new Error('El vídeo no tiene partes descargables.')
-    const totalSize = cursor
+    const { parts, totalSize } = await this.loadParts(internal, client)
     const fileName = `${videoId}${extensionFromFileName(internal.meta.n)}`
     const filePath = path.join(this.store.cacheDir, fileName)
     const mime = internal.meta.mime || mimeForName(internal.meta.n)
@@ -1348,6 +1984,41 @@ export class TelegramService {
     }
     await this.streamer.prepare(source)
     return source
+  }
+
+  /** Mensajes, ubicaciones y tamaños de las partes de un vídeo, en orden. */
+  private async loadParts(
+    internal: InternalVideo,
+    client: TelegramClient
+  ): Promise<{ parts: StreamPartSource[]; totalSize: number }> {
+    const peer = await this.ensureChannel()
+    const found = await client.getMessages(peer, {
+      ids: internal.parts.map((part) => part.messageId)
+    })
+    const byId = new Map<number, Api.Message>()
+    for (const message of found) {
+      if (message instanceof Api.Message) byId.set(message.id, message)
+    }
+
+    const parts: StreamPartSource[] = []
+    let cursor = 0
+    for (const part of internal.parts) {
+      const message = byId.get(part.messageId)
+      if (!message) throw new Error('Falta una parte del vídeo en Telegram.')
+      const info = getFileInfo(message)
+      if (!info.location) throw new Error('Telegram no devolvió la ubicación del vídeo.')
+      const size = part.size > 0 ? part.size : info.size ? info.size.toJSNumber() : 0
+      if (size <= 0) throw new Error('Una parte del vídeo no tiene tamaño.')
+      parts.push({
+        start: cursor,
+        size,
+        dcId: info.dcId ?? client.session.dcId,
+        location: info.location
+      })
+      cursor += size
+    }
+    if (parts.length === 0) throw new Error('El vídeo no tiene partes descargables.')
+    return { parts, totalSize: cursor }
   }
 
   private fetchStreamRange(
@@ -1401,8 +2072,6 @@ export class TelegramService {
     const videoId = state.videoId
     const extension = extensionFromFileName(internal.meta.n)
     const fileName = `${videoId}${extension}`
-    const destination = path.join(this.store.cacheDir, fileName)
-    let writer: fs.WriteStream | null = null
     let downloaded = 0
     let lastEmit = Date.now()
     let lastBytes = 0
@@ -1418,47 +2087,31 @@ export class TelegramService {
       this.events.downloadProgress({ ...state })
     }
     try {
-      const client = await this.connect()
-      const peer = await this.ensureChannel()
-      writer = fs.createWriteStream(destination)
-      const messageIds = internal.parts.map((part) => part.messageId)
-      const found = await client.getMessages(peer, { ids: messageIds })
-      const byId = new Map<number, Api.Message>()
-      for (const message of found) {
-        if (message instanceof Api.Message) byId.set(message.id, message)
-      }
-      for (const part of internal.parts) {
-        const message = byId.get(part.messageId)
-        if (!message) throw new Error('Falta una parte del vídeo en Telegram.')
-        await downloadPartToStream(
-          client,
-          message,
-          writer,
-          controller.signal,
-          (bytes) => {
-            if (controller.signal.aborted) return
-            downloaded += bytes
-            emit()
-          }
-        )
-      }
-      writer.end()
-      await finished(writer)
-      const stat = fs.statSync(destination)
-      if (internal.meta.size > 0 && stat.size !== internal.meta.size) {
-        throw new Error('La descarga quedó incompleta. Vuelve a intentarlo.')
-      }
-      this.store.addCache(videoId, fileName, stat.size)
+      await this.requireAuthorized()
+      const source = await this.ensureStreamSource(videoId)
+      state.totalBytes = source.totalSize
+      await this.streamer.downloadAll(source, {
+        signal: controller.signal,
+        onProgress: (cachedBytes) => {
+          downloaded = cachedBytes
+          emit()
+        }
+      })
+      const total = source.totalSize > 0 ? source.totalSize : internal.meta.size
+      this.store.addCache(videoId, fileName, total)
+      this.queueLocalCovers()
       state.status = 'done'
-      state.downloadedBytes = stat.size
+      state.downloadedBytes = total
+      state.totalBytes = total
       state.speed = 0
+      state.error = undefined
       this.events.downloadProgress({ ...state })
       const protectedIds = this.activeVideoId ? new Set([this.activeVideoId]) : undefined
       const evicted = this.store.pruneCache(videoId, protectedIds)
       if (evicted.length > 0) this.events.libraryChanged()
     } catch (error) {
-      writer?.destroy()
-      fs.rmSync(destination, { force: true })
+      // Los bloques ya guardados se conservan: al reintentar se retoma desde
+      // ahí en vez de empezar el archivo otra vez.
       const cancelled = controller.signal.aborted || String(error).includes('DOWNLOAD_CANCELLED')
       state.status = cancelled ? 'cancelled' : 'error'
       state.speed = 0
@@ -1490,19 +2143,20 @@ export class TelegramService {
     await this.requireAuthorized()
     let file = this.store.getCacheFile(videoId)
     if (!file) {
-      if (!this.videoIndex.size) await this.listLibrary()
-      const existing = this.downloadJobs.get(videoId)
-      if (existing && existing.state.status === 'downloading') {
-        await existing.promise
+      await this.ensureIndexed(videoId)
+      let job = this.downloadJobs.get(videoId)
+      if (job && job.state.status === 'downloading') {
+        await job.promise
       } else {
-        if (existing) this.downloadJobs.delete(videoId)
-        // El reproductor del sistema necesita el archivo completo, no una
-        // caché parcial. Se libera el archivo antes de descargarlo.
-        await this.streamer.remove(videoId)
-        this.streamSources.delete(videoId)
+        if (job) this.downloadJobs.delete(videoId)
+        // El reproductor del sistema necesita el archivo completo; la descarga
+        // retoma la caché progresiva en vez de liberarla.
         this.startDownload(videoId)
-        const job = this.downloadJobs.get(videoId)
+        job = this.downloadJobs.get(videoId)
         if (job) await job.promise
+      }
+      if (job && job.state.status === 'error') {
+        throw new Error(job.state.error || 'No se pudo descargar el vídeo para abrirlo.')
       }
       file = this.store.getCacheFile(videoId)
     }

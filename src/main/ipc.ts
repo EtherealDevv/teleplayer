@@ -7,7 +7,15 @@ import {
   systemPreferences
 } from 'electron'
 import type { OpenDialogOptions } from 'electron'
-import type { AppSettings, BootstrapData, CacheInfo, Library } from '../shared/types'
+import type {
+  AppSettings,
+  BootstrapData,
+  CacheInfo,
+  ImportBatchResult,
+  ImportFolderResult,
+  ImportProgress,
+  Library
+} from '../shared/types'
 import type { AppStore } from './store'
 import type { TelegramService } from './telegram'
 import { errorText } from './errors'
@@ -93,6 +101,11 @@ export function registerIpc(
   handle('auth:state', () => telegram.state)
 
   handle('library:refresh', (): Promise<Library> => telegram.listLibrary())
+  handle('library:load-more', (): Promise<Library> => telegram.loadMore())
+  handle('library:imports', (): ImportProgress[] => telegram.imports())
+  handle('library:cancel-import', (jobId: string): void => telegram.cancelImport(jobId))
+  handle('library:retry-import', (jobId: string): void => telegram.retryImport(jobId))
+  handle('library:rebuild-covers', () => telegram.rebuildCovers())
 
   handle(
     'library:import-dialog',
@@ -131,8 +144,38 @@ export function registerIpc(
       if (result.canceled || result.filePaths.length === 0) {
         return { cancelled: true, count: 0 }
       }
-      const count = telegram.queueImport(result.filePaths, folderId ?? null)
+      const count = await telegram.queueImport(result.filePaths, folderId ?? null)
       return { cancelled: false, count }
+    }
+  )
+
+  /**
+   * Importa rutas absolutas: archivos sueltos y carpetas completas. El
+   * renderer manda aquí lo que suelta el usuario, ya resuelto con
+   * `webUtils.getPathForFile`.
+   */
+  handle('library:import-paths', (paths: unknown, folderId: string | null): Promise<ImportBatchResult> => {
+    const list = Array.isArray(paths) ? paths.map((entry) => String(entry)) : []
+    return telegram.queueImportPaths(list, folderId ?? null)
+  })
+
+  handle(
+    'library:import-folder-dialog',
+    async (folderId: string | null): Promise<ImportFolderResult> => {
+      const win = getWindow()
+      const options: OpenDialogOptions = {
+        title: 'Añadir carpetas a TelePlayer',
+        defaultPath: app.getPath('videos'),
+        properties: ['openDirectory', 'multiSelections']
+      }
+      const result = win
+        ? await dialog.showOpenDialog(win, options)
+        : await dialog.showOpenDialog(options)
+      if (result.canceled || result.filePaths.length === 0) {
+        return { cancelled: true, videos: 0, folders: 0, ignored: 0, duplicates: 0 }
+      }
+      const batch = await telegram.queueImportPaths(result.filePaths, folderId ?? null)
+      return { cancelled: false, ...batch }
     }
   )
 
@@ -155,11 +198,12 @@ export function registerIpc(
     await shell.openPath(store.cacheDir)
   })
 
-  handle('playback:open', (videoId: string) => telegram.open(videoId))
+  handle('playback:open', (videoId: string, preview?: boolean) => telegram.open(videoId, preview))
   handle('playback:status', (videoId: string) => telegram.status(videoId))
   handle('playback:stream-status', (videoId: string) => telegram.streamStatus(videoId))
   handle('playback:url', (videoId: string) => telegram.url(videoId))
   handle('playback:cancel', (videoId: string) => telegram.cancelDownload(videoId))
+  handle('playback:cancel-stream', (videoId: string) => telegram.cancelStream(videoId))
   handle('playback:download', (videoId: string) => telegram.download(videoId))
   handle('playback:set-active', (videoId: string | null) => {
     telegram.setActivePlayback(videoId)

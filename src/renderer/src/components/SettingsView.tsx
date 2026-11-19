@@ -43,6 +43,7 @@ export function SettingsView({
   const [logoutOpen, setLogoutOpen] = useState(false)
   const [resetOpen, setResetOpen] = useState(false)
   const [busy, setBusy] = useState(false)
+  const [coverBusy, setCoverBusy] = useState(false)
   const user = auth.user
   const name = [user?.firstName, user?.lastName].filter(Boolean).join(' ') || 'Tu cuenta'
 
@@ -119,7 +120,33 @@ export function SettingsView({
     }
   }
 
-  const cachePercent = progressPercent(cache?.bytes ?? 0, cache?.limitBytes ?? 0)
+  const rebuildCovers = async (): Promise<void> => {
+    if (coverBusy) return
+    setCoverBusy(true)
+    try {
+      const result = await api.library.rebuildCovers()
+      await onRefresh(true)
+      if (result.total === 0) {
+        onToast('Todos los vídeos ya tienen portada.', 'info')
+      } else if (result.failed === 0) {
+        onToast(`Portadas regeneradas: ${result.generated} de ${result.total}.`, 'success')
+      } else {
+        onToast(
+          `${result.generated} portadas nuevas. ${result.failed} no se pudieron generar (el índice del MP4 está al final o falta el archivo).`,
+          'info'
+        )
+      }
+    } catch (caught) {
+      onToast(cleanError(caught), 'error')
+    } finally {
+      setCoverBusy(false)
+    }
+  }
+
+  const cachePercent = progressPercent(
+    (cache?.bytes ?? 0) + (cache?.partialBytes ?? 0),
+    cache?.limitBytes ?? 0
+  )
   const themeOptions: Array<{ value: AppSettings['themeMode']; icon: string; label: string }> = [
     { value: 'light', icon: 'light_mode', label: 'Claro' },
     { value: 'dark', icon: 'dark_mode', label: 'Oscuro' },
@@ -263,6 +290,16 @@ export function SettingsView({
               </div>
               <p>
                 {cache?.files ?? 0} {cache?.files === 1 ? 'archivo en caché' : 'archivos en caché'}.
+                {cache && cache.partialBytes > 0 ? (
+                  <>
+                    {' '}
+                    Otros {formatBytes(cache.partialBytes)} en {cache.partialFiles}{' '}
+                    {cache.partialFiles === 1
+                      ? 'vídeo a medio guardar'
+                      : 'vídeos a medio guardar'}
+                    .
+                  </>
+                ) : null}{' '}
                 Los originales siempre están en Telegram.
               </p>
             </div>
@@ -295,6 +332,33 @@ export function SettingsView({
             </div>
           </section>
 
+          <section className="settings-card">
+            <div className="settings-card-head">
+              <span className="settings-icon">
+                <Icon name="image" size={21} />
+              </span>
+              <div>
+                <h2>Portadas</h2>
+                <p>El primer fotograma de cada vídeo, también en los antiguos.</p>
+              </div>
+            </div>
+            <p className="settings-hint">
+              TelePlayer usa la copia local si existe y, si no, pide a Telegram solo los primeros
+              megabytes del vídeo. Algunos MP4 con el índice al final no se pueden leer a medias:
+              esos estrenan portada cuando se reproducen una vez.
+            </p>
+            <div className="settings-button-row">
+              <button className="btn tonal" onClick={() => void rebuildCovers()} disabled={coverBusy}>
+                {coverBusy ? (
+                  <span className="mini-spinner" />
+                ) : (
+                  <Icon name="auto_awesome" size={18} />
+                )}
+                {coverBusy ? 'Regenerando portadas…' : 'Regenerar portadas que falten'}
+              </button>
+            </div>
+          </section>
+
           <section className="settings-card account-card">
             <div className="settings-card-head">
               <span className="settings-icon">
@@ -313,7 +377,8 @@ export function SettingsView({
               <div>
                 <strong>{library.channelTitle}</strong>
                 <span>
-                  {formatBytes(library.totalSize)} · {library.videos.length} vídeos
+                  {formatBytes(library.totalSize)} · {library.videos.length}
+                  {library.hasMore ? '+' : ''} vídeos cargados
                 </span>
               </div>
               <span className="secure-badge">

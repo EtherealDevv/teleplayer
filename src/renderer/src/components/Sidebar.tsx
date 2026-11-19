@@ -14,6 +14,7 @@ interface SidebarProps {
   onOpenLibrary: () => void
   onOpenSettings: () => void
   onImport: () => void
+  onImportFolder: () => void
   onCreateFolder: () => void
   onEditFolder: (folder: Folder) => void
   onDeleteFolder: (folder: Folder) => void
@@ -37,6 +38,7 @@ export function Sidebar({
   onOpenLibrary,
   onOpenSettings,
   onImport,
+  onImportFolder,
   onCreateFolder,
   onEditFolder,
   onDeleteFolder
@@ -245,9 +247,19 @@ export function Sidebar({
         ) : null}
       </div>
 
-      <button className="sidebar-fab" onClick={onImport} aria-label="Añadir vídeos" title="Añadir vídeos">
-        <Icon name="add" size={24} />
-      </button>
+      <div className="sidebar-fab-row">
+        <button
+          className="sidebar-fab ghost"
+          onClick={onImportFolder}
+          aria-label="Añadir carpeta"
+          title="Añadir carpeta con sus vídeos"
+        >
+          <Icon name="create_new_folder" size={22} />
+        </button>
+        <button className="sidebar-fab" onClick={onImport} aria-label="Añadir vídeos" title="Añadir vídeos">
+          <Icon name="add" size={24} />
+        </button>
+      </div>
 
       <div className="sidebar-bottom">
         <div className="sidebar-storage">

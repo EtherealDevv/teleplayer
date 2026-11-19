@@ -65,6 +65,8 @@ export function Player({
   const [buffering, setBuffering] = useState(false)
   const [slowBuffer, setSlowBuffer] = useState(false)
   const [bufferAhead, setBufferAhead] = useState(0)
+  const [seekValue, setSeekValue] = useState<number | null>(null)
+  const [reloadKey, setReloadKey] = useState(0)
 
   const stageRef = useRef<HTMLDivElement | null>(null)
   const screenRef = useRef<HTMLDivElement | null>(null)
@@ -75,6 +77,14 @@ export function Player({
   const resumeAppliedRef = useRef(false)
   const hideTimerRef = useRef<number | null>(null)
   const noticeTimerRef = useRef<number | null>(null)
+  const seekTimerRef = useRef<number | null>(null)
+  // Un salto en el vídeo se aplica al elemento una sola vez, 180 ms después
+  // del último movimiento de la barra: antes se lanzaba una petición de rango
+  // por cada píxel arrastrado y Telegram acababa rechazando el rango lejano.
+  const pendingSeekRef = useRef<number | null>(null)
+  const resumeAfterReloadRef = useRef<number | null>(null)
+  const recoverAttemptsRef = useRef(0)
+  const lastRecoveryRef = useRef(0)
 
   const resolveUrl = useCallback(async (): Promise<void> => {
     try {
@@ -146,10 +156,14 @@ export function Player({
 
   useEffect(() => {
     if (!video.cached && stream?.status === 'error') {
+      // El streamer marca el error de una petición concreta; el reproductor
+      // suele recuperarse solo al repetir el rango. Solo se pasa a la
+      // pantalla de error si el vídeo nunca llegó a arrancar.
+      if (src && phase === 'ready') return
       setError(stream.error || 'No se pudo transmitir el vídeo desde Telegram.')
       setPhase('error')
     }
-  }, [stream, video.cached])
+  }, [stream, video.cached, src, phase])
 
   useEffect(() => {
     if (phase !== 'downloading' && phase !== 'loading' && phase !== 'cancelled') return
@@ -376,12 +390,62 @@ export function Player({
     wakeControls()
   }
 
-  const seek = (value: number): void => {
+  const commitSeek = (value: number): void => {
     const element = videoRef.current
+    pendingSeekRef.current = null
+    setSeekValue(null)
     if (!element) return
-    element.currentTime = value
+    if (Number.isFinite(value)) element.currentTime = value
     setCurrentTime(value)
     wakeControls()
+  }
+
+  const flushSeek = (): void => {
+    if (seekTimerRef.current) {
+      window.clearTimeout(seekTimerRef.current)
+      seekTimerRef.current = null
+    }
+    const pending = pendingSeekRef.current
+    if (pending !== null) commitSeek(pending)
+  }
+
+  const seekPreview = (value: number): void => {
+    pendingSeekRef.current = value
+    setSeekValue(value)
+    wakeControls()
+    if (seekTimerRef.current) window.clearTimeout(seekTimerRef.current)
+    seekTimerRef.current = window.setTimeout(() => {
+      seekTimerRef.current = null
+      const pending = pendingSeekRef.current
+      if (pending !== null) commitSeek(pending)
+    }, 180)
+  }
+
+  useEffect(() => {
+    return () => {
+      if (seekTimerRef.current) window.clearTimeout(seekTimerRef.current)
+    }
+  }, [])
+
+  /**
+   * El streamer ya reintenta cada bloque, pero si el elemento de vídeo muere
+   * (un rango que Telegram cortó, un salto muy lejos del final del archivo)
+   * se recarga el mismo origen y se vuelve a la posición donde estaba en vez
+   * de mandar al usuario a la pantalla de error.
+   */
+  const recoverPlayback = (): boolean => {
+    const element = videoRef.current
+    if (!element || video.cached) return false
+    const now = Date.now()
+    if (recoverAttemptsRef.current >= 3) return false
+    if (now - lastRecoveryRef.current < 4000) return false
+    recoverAttemptsRef.current += 1
+    lastRecoveryRef.current = now
+    const position = element.currentTime
+    resumeAfterReloadRef.current = Number.isFinite(position) && position > 1 ? position : null
+    setBuffering(true)
+    setReloadKey((value) => value + 1)
+    return true
   }
 
   const onLoadedMetadata = (): void => {
@@ -402,6 +466,13 @@ export function Player({
         noticeTimerRef.current = window.setTimeout(() => setResumeNotice(null), 4200)
       }
     }
+    const resumeAt = resumeAfterReloadRef.current
+    if (resumeAt !== null) {
+      resumeAfterReloadRef.current = null
+      const limit = Math.max(0, (element.duration || video.duration || resumeAt) - 1)
+      element.currentTime = Math.min(resumeAt, limit)
+      setCurrentTime(element.currentTime)
+    }
     resumeAppliedRef.current = true
     void element.play().catch(() => setPlaying(false))
   }
@@ -409,11 +480,14 @@ export function Player({
   const retry = async (): Promise<void> => {
     setError('')
     setPhase('loading')
+    recoverAttemptsRef.current = 0
+    resumeAfterReloadRef.current = null
     try {
       const result = await api.playback.open(video.id)
       if (result.state) setDownloadState(result.state)
       if (result.url) {
         setSrc(result.url)
+        setReloadKey((value) => value + 1)
         setPhase('ready')
       } else {
         setPhase('downloading')
@@ -472,7 +546,7 @@ export function Player({
     downloadState?.downloadedBytes ?? 0,
     downloadState?.totalBytes ?? video.size
   )
-  const seekPercent = progressPercent(currentTime, duration)
+  const seekPercent = progressPercent(seekValue ?? currentTime, duration)
   const isUiHidden = playing && phase === 'ready' && !controlsVisible
 
   return (
@@ -590,6 +664,7 @@ export function Player({
       >
         {phase === 'ready' && src ? (
           <video
+            key={reloadKey}
             ref={videoRef}
             className="player-video"
             src={src}
@@ -640,7 +715,10 @@ export function Player({
               window.localStorage.setItem('teleplayer-volume', String(event.currentTarget.volume))
             }}
             onError={() => {
-              setError('Este formato no se pudo reproducir en la app. Puedes descargarlo y abrirlo con tu reproductor.')
+              if (recoverPlayback()) return
+              setError(
+                'Este formato no se pudo reproducir en la app. Puedes descargarlo y abrirlo con tu reproductor.'
+              )
               setPhase('error')
             }}
           />
@@ -762,15 +840,18 @@ export function Player({
         <div className={`player-controls-wrap${isUiHidden ? ' ui-hidden' : ''}`} onClick={(event) => event.stopPropagation()}>
           <div className="player-controls">
             <div className="seek-row">
-              <span className="time-label">{formatTimecode(currentTime)}</span>
+              <span className="time-label">{formatTimecode(seekValue ?? currentTime)}</span>
               <input
                 className="player-slider"
                 type="range"
                 min={0}
                 max={duration || 0}
                 step={0.1}
-                value={Math.min(currentTime, duration || 0)}
-                onChange={(event) => seek(Number(event.target.value))}
+                value={Math.min(seekValue ?? currentTime, duration || 0)}
+                onChange={(event) => seekPreview(Number(event.target.value))}
+                onPointerUp={flushSeek}
+                onKeyUp={flushSeek}
+                onBlur={flushSeek}
                 style={{ '--seek': `${seekPercent}%` } as CSSProperties}
                 aria-label="Posición del vídeo"
               />

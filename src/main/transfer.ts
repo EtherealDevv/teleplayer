@@ -1,20 +1,24 @@
 import { Api, TelegramClient } from 'teleproto'
 import { generateRandomLong } from 'teleproto/Helpers'
-import { getFileInfo } from 'teleproto/Utils'
-import { BoundedSemaphore, OrderedWriter } from 'teleproto/network/OrderedWriter'
-import bigInt from 'big-integer'
 import fs from 'node:fs'
-import { once } from 'node:events'
+import { delayWithSignal, floodWaitMs, retryDelay } from './retry'
 
 export const FREE_FILE_LIMIT = 2_000_000_000
 export const PREMIUM_FILE_LIMIT = 4_000_000_000
 const UPLOAD_CONCURRENCY = 16
-const DOWNLOAD_PART_SIZE = 512 * 1024
+const UPLOAD_MAX_ATTEMPTS = 5
+const UPLOAD_RETRY_BASE_MS = 800
 
 export function fileLimitFor(premium: boolean | undefined): number {
   return premium ? PREMIUM_FILE_LIMIT : FREE_FILE_LIMIT
 }
 
+/**
+ * Mismo criterio que `getAppropriatedPartSize` de teleproto (el que usan los
+ * clientes de referencia): 128 KB hasta 100 MB, 256 KB hasta 750 MB y 512 KB
+ * por encima. Partes más pequeñas que 128 KB no caben en `upload.saveFilePart`
+ * sin disparar el número de peticiones.
+ */
 export function uploadPartSizeFor(bytes: number): number {
   if (bytes < 100 * 1024 * 1024) return 128 * 1024
   if (bytes < 750 * 1024 * 1024) return 256 * 1024
@@ -29,6 +33,29 @@ export interface UploadRangeOptions {
   name: string
   onProgress: (uploadedBytes: number) => void
   signal?: AbortSignal
+}
+
+/**
+ * Una parte de subida se puede perder por un corte de red, un timeout o un
+ * FLOOD_WAIT del servidor. Reintentarla es barato: la parte siguiente todavía
+ * no ha salido. Antes, el primer fallo de una parte abortaba el archivo entero
+ * y la importación se daba por perdida.
+ */
+async function savePartWithRetry(
+  save: () => Promise<boolean | undefined>,
+  signal: AbortSignal
+): Promise<boolean | undefined> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await save()
+    } catch (error) {
+      if (signal.aborted) throw error
+      if (attempt >= UPLOAD_MAX_ATTEMPTS - 1) throw error
+      const flood = floodWaitMs(error)
+      const wait = flood ?? retryDelay(attempt, UPLOAD_RETRY_BASE_MS)
+      await delayWithSignal(wait, signal, 'UPLOAD_CANCELLED')
+    }
+  }
 }
 
 /**
@@ -79,26 +106,30 @@ export async function uploadRange({
             if (bytesRead !== size) {
               throw new Error('No se pudo leer una parte del archivo. ¿Se movió o cambió?')
             }
-            const saved = isLarge
-              ? await client._media.savePart(
-                  dcId,
-                  new Api.upload.SaveBigFilePart({
-                    fileId,
-                    filePart: index,
-                    fileTotalParts: totalParts,
-                    bytes: buffer
-                  }),
-                  controller.signal
-                )
-              : await client._media.savePart(
-                  dcId,
-                  new Api.upload.SaveFilePart({
-                    fileId,
-                    filePart: index,
-                    bytes: buffer
-                  }),
-                  controller.signal
-                )
+            const saved = await savePartWithRetry(
+              () =>
+                isLarge
+                  ? client._media.savePart(
+                      dcId,
+                      new Api.upload.SaveBigFilePart({
+                        fileId,
+                        filePart: index,
+                        fileTotalParts: totalParts,
+                        bytes: buffer
+                      }),
+                      controller.signal
+                    )
+                  : client._media.savePart(
+                      dcId,
+                      new Api.upload.SaveFilePart({
+                        fileId,
+                        filePart: index,
+                        bytes: buffer
+                      }),
+                      controller.signal
+                    ),
+              controller.signal
+            )
             if (saved === false) throw new Error('Telegram rechazó una parte del archivo.')
             uploaded += size
             onProgress(uploaded)
@@ -122,78 +153,4 @@ export async function uploadRange({
   return isLarge
     ? new Api.InputFileBig({ id: fileId, parts: totalParts, name })
     : new Api.InputFile({ id: fileId, parts: totalParts, name, md5Checksum: '' })
-}
-
-/**
- * Descarga una parte de un mensaje usando varias conexiones en paralelo y
- * escribe los bloques en orden. Antes se pedían bloques de 512 KB uno detrás
- * de otro, lo que dejaba la descarga limitada a una sola conexión.
- */
-export async function downloadPartToStream(
-  client: TelegramClient,
-  message: Api.Message,
-  writer: fs.WriteStream,
-  signal: AbortSignal,
-  onBytes: (bytes: number) => void
-): Promise<void> {
-  const info = getFileInfo(message)
-  const totalBytes = info.size ? info.size.toJSNumber() : 0
-  if (totalBytes <= 0) {
-    for await (const chunk of client.iterDownload(message, {
-      requestSize: DOWNLOAD_PART_SIZE,
-      signal
-    })) {
-      if (!writer.write(chunk)) await once(writer, 'drain')
-      onBytes(chunk.length)
-    }
-    return
-  }
-
-  const route = { dcId: info.dcId ?? client.session.dcId }
-  const totalParts = Math.max(1, Math.ceil(totalBytes / DOWNLOAD_PART_SIZE))
-  const ordered = new OrderedWriter({
-    write: async (buffer: Buffer) => {
-      if (!writer.write(buffer)) await once(writer, 'drain')
-    }
-  })
-  const download = client._media.opts.download
-  const inflight = new BoundedSemaphore(
-    Math.max(1, download.sessions * download.inFlight)
-  )
-  let firstError: unknown
-  const tasks: Array<Promise<void>> = []
-
-  for (let index = 0; index < totalParts; index += 1) {
-    if (signal.aborted || firstError) break
-    await inflight.acquire()
-    if (signal.aborted || firstError) {
-      inflight.release()
-      break
-    }
-    tasks.push(
-      (async () => {
-        try {
-          const data = await client._media.getFile(
-            route.dcId,
-            info.location,
-            bigInt(index).multiply(DOWNLOAD_PART_SIZE),
-            DOWNLOAD_PART_SIZE,
-            signal,
-            (dc) => {
-              route.dcId = dc
-            }
-          )
-          if (firstError) return
-          await ordered.write(index, data, (bytes) => onBytes(bytes))
-        } catch (error) {
-          if (!firstError) firstError = error
-        } finally {
-          inflight.release()
-        }
-      })()
-    )
-  }
-
-  await Promise.all(tasks)
-  if (firstError) throw firstError
 }

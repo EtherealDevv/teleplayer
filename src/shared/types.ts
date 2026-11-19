@@ -69,6 +69,8 @@ export interface Library {
   videos: VideoItem[]
   channelTitle: string
   totalSize: number
+  /** Quedan páginas de historial más antiguas por pedir con `library.loadMore`. */
+  hasMore: boolean
   user?: AuthUser
 }
 
@@ -147,6 +149,9 @@ export interface CacheInfo {
   bytes: number
   files: number
   limitBytes: number
+  /** Bytes de vídeos a medio guardar (caché progresiva) que aún no cuentan como descarga. */
+  partialBytes: number
+  partialFiles: number
 }
 
 export interface PlaybackOpenResult {
@@ -161,6 +166,13 @@ export interface ThumbEvent {
   url: string
 }
 
+/** Resultado de regenerar portadas que faltaban en la biblioteca. */
+export interface CoverRebuildResult {
+  total: number
+  generated: number
+  failed: number
+}
+
 export interface AppUpdate {
   settings?: Partial<AppSettings>
 }
@@ -169,6 +181,25 @@ export interface FolderInput {
   name: string
   emoji: string
   color: string
+}
+
+/**
+ * Resultado de soltar archivos o carpetas en la app. `folders` cuenta las
+ * carpetas nuevas creadas en la biblioteca, `videos` los archivos aceptados e
+ * `ignored` los elementos descartados (archivos que no son vídeo, carpetas
+ * vacías, rutas ilegibles…).
+ */
+export interface ImportBatchResult {
+  videos: number
+  folders: number
+  ignored: number
+  /** Archivos omitidos por ser ya parte de la biblioteca (mismo nombre y tamaño). */
+  duplicates: number
+}
+
+/** Igual que `ImportBatchResult`, más el caso de cancelar el diálogo. */
+export interface ImportFolderResult extends ImportBatchResult {
+  cancelled: boolean
 }
 
 export interface WindowApi {
@@ -190,7 +221,17 @@ export interface WindowApi {
 
   library: {
     refresh(silent?: boolean): Promise<Library>
+    /** Pide la siguiente página de historial del canal y la funde con la biblioteca. */
+    loadMore(): Promise<Library>
+    imports(): Promise<ImportProgress[]>
+    cancelImport(jobId: string): Promise<void>
+    retryImport(jobId: string): Promise<void>
+    rebuildCovers(): Promise<CoverRebuildResult>
     importDialog(folderId: string | null): Promise<{ cancelled: boolean; count: number }>
+    importFolderDialog(folderId: string | null): Promise<ImportFolderResult>
+    importPaths(paths: string[], folderId: string | null): Promise<ImportBatchResult>
+    /** Ruta absoluta en disco de un archivo arrastrado (solo lectura). */
+    pathForFile(file: unknown): string
     deleteVideo(videoId: string): Promise<void>
     moveVideo(videoId: string, folderId: string | null): Promise<void>
     renameVideo(videoId: string, title: string): Promise<void>
@@ -204,11 +245,13 @@ export interface WindowApi {
   }
 
   playback: {
-    open(videoId: string): Promise<PlaybackOpenResult>
+    open(videoId: string, preview?: boolean): Promise<PlaybackOpenResult>
     status(videoId: string): Promise<DownloadProgress | null>
     streamStatus(videoId: string): Promise<StreamProgress | null>
     url(videoId: string): Promise<string | null>
     cancel(videoId: string): Promise<void>
+    /** Cierra la caché progresiva de un vídeo (vista previa), sin tocar descargas completas. */
+    cancelStream(videoId: string): Promise<void>
     download(videoId: string): Promise<void>
     setActive(videoId: string | null): Promise<void>
     saveProgress(videoId: string, position: number, duration: number): Promise<void>

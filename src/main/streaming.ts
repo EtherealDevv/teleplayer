@@ -1,15 +1,16 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import type { StreamProgress, StreamStatus } from '../shared/types'
+import { CHUNK_SIZE, MANIFEST_VERSION, manifestPathFor } from './cache-format'
 import { errorText } from './errors'
+import { delayWithSignal as delayUntil, floodWaitMs, retryDelay as backoffDelay } from './retry'
 
-const CHUNK_SIZE = 512 * 1024
-const MANIFEST_VERSION = 1
 const PREFETCH_AHEAD = 12
 const MIN_PREFETCH_AHEAD = 4
 const MAX_PREFETCH_AHEAD = 24
-const PREFETCH_CONCURRENCY = 3
-const FETCH_ATTEMPTS = 3
+const PREFETCH_CONCURRENCY = 4
+const DOWNLOAD_CONCURRENCY = 4
+const FETCH_ATTEMPTS = 4
 const FETCH_RETRY_BASE_MS = 600
 const FETCH_TIMEOUT_MS = 30_000
 const FETCH_TIMEOUT_MIN_MS = 12_000
@@ -46,6 +47,13 @@ export interface StreamSource {
   onComplete: () => void
 }
 
+export interface DownloadAllOptions {
+  signal?: AbortSignal
+  /** Bytes ya guardados y tamaño total, para reflejar el avance real. */
+  onProgress?: (cachedBytes: number, totalBytes: number) => void
+  concurrency?: number
+}
+
 interface StreamSession {
   source: StreamSource
   handle: fs.promises.FileHandle
@@ -67,10 +75,12 @@ interface StreamSession {
   speed: number
   status: StreamStatus
   error?: string
-}
-
-function manifestPathFor(filePath: string): string {
-  return `${filePath}.tp.json`
+  /**
+   * Una descarga completa fija la sesión: el cierre por inactividad no la
+   * toca mientras queden bloques, para no cortar la descarga al cerrar el
+   * reproductor.
+   */
+  pinned: boolean
 }
 
 function chunkLength(totalSize: number, index: number): number {
@@ -108,9 +118,7 @@ function waitWithSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T
 }
 
 function retryDelay(attempt: number): number {
-  const base = FETCH_RETRY_BASE_MS * 2 ** attempt
-  // Un poco de jitter evita que varios bloques reintenten exactamente a la vez.
-  return Math.round(base * (0.75 + Math.random() * 0.5))
+  return backoffDelay(attempt, FETCH_RETRY_BASE_MS)
 }
 
 function fetchTimeoutFor(length: number): number {
@@ -119,23 +127,7 @@ function fetchTimeoutFor(length: number): number {
 }
 
 function delayWithSignal(ms: number, signal: AbortSignal): Promise<void> {
-  if (signal.aborted) return Promise.reject(new Error('STREAM_CANCELLED'))
-  return new Promise<void>((resolve, reject) => {
-    let timer: NodeJS.Timeout
-    const onAbort = (): void => {
-      cleanup()
-      reject(new Error('STREAM_CANCELLED'))
-    }
-    const cleanup = (): void => {
-      clearTimeout(timer)
-      signal.removeEventListener('abort', onAbort)
-    }
-    timer = setTimeout(() => {
-      cleanup()
-      resolve()
-    }, ms)
-    signal.addEventListener('abort', onAbort, { once: true })
-  })
+  return delayUntil(ms, signal, 'STREAM_CANCELLED')
 }
 
 async function readManifest(filePath: string, totalSize: number): Promise<Set<number> | null> {
@@ -174,12 +166,32 @@ async function readManifest(filePath: string, totalSize: number): Promise<Set<nu
 export class MediaStreamer {
   private sessions = new Map<string, StreamSession>()
   private detached = new Map<string, { bytes: number; filePath: string }>()
+  private preparing = new Map<string, Promise<void>>()
   private cacheDir: string
   private onProgress: (state: StreamProgress) => void
+  private onPartial?: (videoId: string, filePath: string) => void
 
-  constructor(cacheDir: string, onProgress: (state: StreamProgress) => void) {
+  constructor(
+    cacheDir: string,
+    onProgress: (state: StreamProgress) => void,
+    options?: { onPartial?: (videoId: string, filePath: string) => void }
+  ) {
     this.cacheDir = cacheDir
     this.onProgress = onProgress
+    this.onPartial = options?.onPartial
+  }
+
+  /**
+   * Ajusta el colchón de descarga de la sesión abierta. La vista previa de una
+   * tarjeta usa unos pocos bloques; el reproductor, el cálculo por bitrate.
+   */
+  setPrefetchBytes(videoId: string, bytes: number | undefined): void {
+    const session = this.sessions.get(videoId)
+    if (!session) return
+    session.prefetchAhead =
+      bytes && bytes > 0
+        ? Math.max(MIN_PREFETCH_AHEAD, Math.min(MAX_PREFETCH_AHEAD, Math.ceil(bytes / CHUNK_SIZE)))
+        : PREFETCH_AHEAD
   }
 
   async prepare(source: StreamSource): Promise<void> {
@@ -191,9 +203,39 @@ export class MediaStreamer {
       current.source.totalSize === source.totalSize
     ) {
       this.clearIdleTimer(current)
+      // Un error de un rango anterior no debe condenar la sesión: la
+      // siguiente petición vuelve a intentarlo con el mismo archivo.
+      current.error = undefined
+      current.source = source
       return
     }
-    if (current) await this.close(source.videoId, true)
+    // Dos peticiones de rango a la vez (un salto en la barra abre una nueva
+    // mientras la anterior seguía viva) no deben abrir el archivo dos veces.
+    const pending = this.preparing.get(source.videoId)
+    if (pending) {
+      await pending.catch(() => undefined)
+      if (this.sessions.has(source.videoId)) {
+        const ready = this.sessions.get(source.videoId)!
+        ready.error = undefined
+        ready.source = source
+        this.clearIdleTimer(ready)
+        return
+      }
+    }
+    const task = this.openSession(source)
+    this.preparing.set(source.videoId, task)
+    try {
+      await task
+    } finally {
+      if (this.preparing.get(source.videoId) === task) {
+        this.preparing.delete(source.videoId)
+      }
+    }
+  }
+
+  private async openSession(source: StreamSource): Promise<void> {
+    const current = this.sessions.get(source.videoId)
+    if (current) await this.close(source.videoId, true, true)
 
     await fs.promises.mkdir(path.dirname(source.filePath), { recursive: true })
     let handle: fs.promises.FileHandle
@@ -241,7 +283,8 @@ export class MediaStreamer {
       lastEmit: 0,
       lastBytes: cachedBytes,
       speed: 0,
-      status: 'idle'
+      status: 'idle',
+      pinned: false
     }
     this.sessions.set(source.videoId, session)
     this.detached.delete(source.videoId)
@@ -285,6 +328,80 @@ export class MediaStreamer {
     return { bytes, files }
   }
 
+  /**
+   * Descarga el vídeo completo reutilizando la misma caché por bloques que el
+   * streaming. No hay una segunda ruta de escritura: los bloques que el
+   * reproductor ya dejó en disco cuentan como descargados, así que guardar un
+   * vídeo que se estaba transmitiendo solo baja lo que falta.
+   */
+  async downloadAll(source: StreamSource, options: DownloadAllOptions = {}): Promise<void> {
+    const signal = options.signal
+    if (signal?.aborted) throw new Error('DOWNLOAD_CANCELLED')
+    await this.prepare(source)
+    const session = this.sessions.get(source.videoId)
+    if (!session) throw new Error('No se pudo abrir la caché del vídeo.')
+    session.error = undefined
+    session.pinned = true
+    this.clearIdleTimer(session)
+
+    const controller = new AbortController()
+    let aborted = false
+    const abort = (): void => {
+      aborted = true
+      controller.abort()
+    }
+    if (signal) {
+      if (signal.aborted) abort()
+      else signal.addEventListener('abort', abort, { once: true })
+    }
+    options.onProgress?.(session.cachedBytes, session.source.totalSize)
+
+    try {
+      if (!session.complete) {
+        const concurrency = Math.max(
+          1,
+          Math.min(options.concurrency ?? DOWNLOAD_CONCURRENCY, session.totalChunks)
+        )
+        let next = 0
+        let firstError: unknown
+        const workers = Array.from({ length: concurrency }, async () => {
+          while (!aborted && !session.complete) {
+            const index = next
+            next += 1
+            if (index >= session.totalChunks) return
+            try {
+              if (!session.chunks.has(index)) {
+                await this.getChunk(session, index, controller.signal)
+              }
+            } catch (error) {
+              if (aborted || isCancelled(error)) {
+                aborted = true
+                controller.abort()
+                return
+              }
+              if (!firstError) {
+                firstError = error
+                aborted = true
+                controller.abort()
+              }
+              return
+            }
+            options.onProgress?.(session.cachedBytes, session.source.totalSize)
+          }
+        })
+        await Promise.all(workers)
+        if (firstError) throw firstError
+        if (aborted) throw new Error('DOWNLOAD_CANCELLED')
+      }
+    } finally {
+      signal?.removeEventListener('abort', abort)
+      session.pinned = false
+      this.scheduleIdleClose(session)
+    }
+
+    if (!session.complete) throw new Error('La descarga quedó incompleta. Vuelve a intentarlo.')
+  }
+
   async serve(
     source: StreamSource,
     start: number,
@@ -303,7 +420,14 @@ export class MediaStreamer {
     if (start < 0 || end < start || start >= source.totalSize) {
       throw new Error('Rango de vídeo no válido.')
     }
+    // Un error de una petición anterior (por ejemplo, un salto de la barra de
+    // progreso) no dejaba reproducir el resto del vídeo: cada petición nueva
+    // parte de un estado limpio.
+    session.error = undefined
     const finalEnd = Math.min(end, source.totalSize - 1)
+    // Tras un salto grande, la cola de prefetch apuntaba a la posición vieja.
+    session.prefetchQueue.length = 0
+    this.prefetch(session, Math.floor(start / CHUNK_SIZE), session.prefetchAhead)
     session.active += 1
     this.clearIdleTimer(session)
 
@@ -366,9 +490,15 @@ export class MediaStreamer {
     })
   }
 
-  async close(videoId: string, deletePartial = false): Promise<void> {
+  async close(videoId: string, deletePartial = false, force = false): Promise<void> {
     const session = this.sessions.get(videoId)
     if (!session) return
+    // Nunca cerrar un archivo que el reproductor está leyendo: el temporizador
+    // de inactividad puede vencer justo entre prepare() y la primera lectura.
+    if (!force && (session.active > 0 || session.pinned)) {
+      this.scheduleIdleClose(session)
+      return
+    }
     this.sessions.delete(videoId)
     this.clearIdleTimer(session)
     if (session.persistTimer) {
@@ -395,6 +525,9 @@ export class MediaStreamer {
           bytes: session.cachedBytes,
           filePath: session.source.filePath
         })
+        // La portada de un vídeo que solo vive en Telegram se puede sacar de
+        // estos bloques: es la única forma de tenerla sin descargarlo entero.
+        this.onPartial?.(videoId, session.source.filePath)
       }
     } else {
       this.detached.delete(videoId)
@@ -415,12 +548,12 @@ export class MediaStreamer {
       await fs.promises.rm(detached.filePath, { force: true }).catch(() => undefined)
       await fs.promises.rm(manifestPathFor(detached.filePath), { force: true }).catch(() => undefined)
     }
-    await this.close(videoId, true)
+    await this.close(videoId, true, true)
   }
 
   async clear(): Promise<void> {
     for (const videoId of [...this.sessions.keys()]) {
-      await this.close(videoId, true)
+      await this.close(videoId, true, true)
     }
     for (const detached of this.detached.values()) {
       await fs.promises.rm(detached.filePath, { force: true }).catch(() => undefined)
@@ -594,6 +727,13 @@ export class MediaStreamer {
         if (timedOut && length > FETCH_SPLIT_MIN_BYTES) {
           throw new Error('TIMEOUT: la conexión con Telegram tardó demasiado en responder.')
         }
+        // FLOOD_WAIT_N se respeta tal cual: insistir con el backoff normal
+        // reinicia el contador del servidor y alarga el bloqueo.
+        const flood = floodWaitMs(error)
+        if (flood !== null && attempt < FETCH_ATTEMPTS - 1) {
+          await delayWithSignal(flood, signal)
+          continue
+        }
         // Si el abort no vino de cerrar la sesión, lo tratamos como un fallo
         // transitorio de la petición y dejamos que el reintento lo resuelva.
         if (attempt < FETCH_ATTEMPTS - 1) {
@@ -683,10 +823,10 @@ export class MediaStreamer {
 
   private scheduleIdleClose(session: StreamSession): void {
     this.clearIdleTimer(session)
-    if (session.active > 0) return
+    if (session.active > 0 || session.pinned) return
     session.idleTimer = setTimeout(() => {
       session.idleTimer = null
-      if (session.active > 0) return
+      if (session.active > 0 || session.pinned) return
       session.controller.abort()
       void this.close(session.source.videoId).catch(() => undefined)
     }, IDLE_CLOSE_MS)

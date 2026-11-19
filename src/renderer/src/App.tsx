@@ -47,6 +47,7 @@ export default function App(): JSX.Element {
   const [deleteFolder, setDeleteFolder] = useState<Folder | null>(null)
   const [folderBusy, setFolderBusy] = useState(false)
   const [themeTick, setThemeTick] = useState(0)
+  const [dropActive, setDropActive] = useState(false)
 
   const toastTimer = useRef<number | null>(null)
   const playerIdRef = useRef<string | null>(null)
@@ -54,6 +55,9 @@ export default function App(): JSX.Element {
   const refreshQueuedRef = useRef(false)
   const authEventSeenRef = useRef(false)
   const importTimersRef = useRef(new Map<string, number>())
+  const dragDepthRef = useRef(0)
+  /** Páginas del historial cargadas: un refresco silencioso las vuelve a pedir. */
+  const pagesLoadedRef = useRef(1)
 
   const showToast = useCallback((message: string, tone: ToastTone = 'info'): void => {
     if (toastTimer.current) window.clearTimeout(toastTimer.current)
@@ -70,15 +74,28 @@ export default function App(): JSX.Element {
       loadingRef.current = true
       if (!silent) setLoading(true)
       try {
-        const next = await api.library.refresh(silent)
-        setLibrary(next)
+        let resolved = await api.library.refresh(silent)
+        // Un refresco silencioso (importación terminada, descarga completada)
+        // no debe devolver la biblioteca a la primera página: se vuelven a
+        // pedir las mismas páginas que había abiertas. Después se resuelve
+        // todo contra `resolved`, o el reproductor perdería un vídeo que vive
+        // en una página ya cargada.
+        const wanted = silent ? pagesLoadedRef.current : 1
+        if (wanted > 1 && resolved.hasMore) {
+          for (let page = 1; page < wanted && resolved.hasMore; page += 1) {
+            resolved = await api.library.loadMore()
+          }
+        } else {
+          pagesLoadedRef.current = 1
+        }
+        setLibrary(resolved)
         setLibraryError('')
         setSelectedFolder((current) => {
           if (current === 'all' || current === 'none') return current
-          return next.folders.some((folder) => folder.id === current) ? current : 'all'
+          return resolved.folders.some((folder) => folder.id === current) ? current : 'all'
         })
         setPlayer((current) =>
-          current ? next.videos.find((video) => video.id === current.id) ?? null : null
+          current ? resolved.videos.find((video) => video.id === current.id) ?? null : null
         )
       } catch (caught) {
         if (!silent) {
@@ -97,6 +114,12 @@ export default function App(): JSX.Element {
     },
     [showToast]
   )
+
+  const loadMoreLibrary = useCallback(async (): Promise<void> => {
+    const next = await api.library.loadMore()
+    pagesLoadedRef.current += 1
+    setLibrary(next)
+  }, [])
 
   useEffect(() => {
     playerIdRef.current = player?.id ?? null
@@ -203,6 +226,23 @@ export default function App(): JSX.Element {
     }
   }, [auth?.status, library, libraryError, refreshLibrary])
 
+  // Las importaciones viven en el proceso principal: al abrir la app (o al
+  // reconectar) la bandeja se rellena con lo que siga subiéndose o esperando.
+  useEffect(() => {
+    if (auth?.status !== 'authorized') return
+    void api.library
+      .imports()
+      .then((jobs) => {
+        if (jobs.length === 0) return
+        setImports((current) => {
+          const next = { ...current }
+          for (const job of jobs) if (!next[job.jobId]) next[job.jobId] = job
+          return next
+        })
+      })
+      .catch(() => undefined)
+  }, [auth?.status])
+
   useEffect(() => {
     if (!settings || !boot) return
     const result = applyTheme(settings, boot.accentColor)
@@ -288,7 +328,7 @@ export default function App(): JSX.Element {
       const result = await api.library.importDialog(target)
       if (result.cancelled) return
       if (result.count === 0) {
-        showToast('No se seleccionaron vídeos compatibles.', 'info')
+        showToast('No se añadió nada: ya estaba en tu biblioteca o no es un vídeo compatible.', 'info')
       } else {
         showToast(
           result.count === 1
@@ -301,6 +341,125 @@ export default function App(): JSX.Element {
       showToast(cleanError(caught), 'error')
     }
   }
+
+  const importTarget =
+    selectedFolder === 'all' || selectedFolder === 'none' ? null : selectedFolder
+
+  const describeBatch = useCallback(
+    (batch: { videos: number; folders: number; ignored: number; duplicates: number }): void => {
+      if (batch.videos === 0) {
+        if (batch.duplicates > 0) {
+          showToast(
+            batch.duplicates === 1
+              ? 'Ese vídeo ya está en tu biblioteca. No se ha vuelto a subir.'
+              : `${batch.duplicates} vídeos ya estaban en tu biblioteca. No se han vuelto a subir.`,
+            'info'
+          )
+        } else {
+          showToast(
+            batch.ignored > 0
+              ? 'No se encontraron vídeos compatibles en lo que seleccionaste.'
+              : 'No se añadió nada.',
+            'info'
+          )
+        }
+        return
+      }
+      const parts = [
+        `${batch.videos} ${batch.videos === 1 ? 'vídeo en cola' : 'vídeos en cola'}`
+      ]
+      if (batch.folders > 0) {
+        parts.push(
+          `${batch.folders} ${batch.folders === 1 ? 'carpeta nueva' : 'carpetas nuevas'}`
+        )
+      }
+      if (batch.duplicates > 0) {
+        parts.push(
+          `${batch.duplicates} ${batch.duplicates === 1 ? 'repetido' : 'repetidos'} omitido${
+            batch.duplicates === 1 ? '' : 's'
+          }`
+        )
+      }
+      showToast(`${parts.join(' · ')}. Subiendo a Telegram…`, 'info')
+    },
+    [showToast]
+  )
+
+  const handleImportFolder = async (): Promise<void> => {
+    if (!auth || auth.status !== 'authorized') return
+    try {
+      const result = await api.library.importFolderDialog(importTarget)
+      if (result.cancelled) return
+      describeBatch(result)
+    } catch (caught) {
+      showToast(cleanError(caught), 'error')
+    }
+  }
+
+  const handleImportPaths = useCallback(
+    async (paths: string[]): Promise<void> => {
+      if (paths.length === 0) return
+      try {
+        const result = await api.library.importPaths(paths, importTarget)
+        describeBatch(result)
+      } catch (caught) {
+        showToast(cleanError(caught), 'error')
+      }
+    },
+    [describeBatch, importTarget, showToast]
+  )
+
+  // Arrastrar y soltar en cualquier parte de la ventana. Electron ya no
+  // expone `File.path`, así que la ruta se pide al preload (webUtils).
+  useEffect(() => {
+    if (auth?.status !== 'authorized') return
+    const hasFiles = (event: DragEvent): boolean => {
+      const types = event.dataTransfer?.types
+      return Boolean(types && Array.from(types).includes('Files'))
+    }
+    const onDragOver = (event: DragEvent): void => {
+      if (!hasFiles(event)) return
+      event.preventDefault()
+      if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy'
+    }
+    const onDragEnter = (event: DragEvent): void => {
+      if (!hasFiles(event)) return
+      event.preventDefault()
+      dragDepthRef.current += 1
+      setDropActive(true)
+    }
+    const onDragLeave = (): void => {
+      dragDepthRef.current = Math.max(0, dragDepthRef.current - 1)
+      if (dragDepthRef.current === 0) setDropActive(false)
+    }
+    const onDrop = (event: DragEvent): void => {
+      if (!hasFiles(event)) return
+      event.preventDefault()
+      dragDepthRef.current = 0
+      setDropActive(false)
+      const files = Array.from(event.dataTransfer?.files ?? [])
+      const paths = files
+        .map((file) => api.library.pathForFile(file))
+        .filter((value): value is string => Boolean(value))
+      if (paths.length === 0) {
+        showToast('No se pudo leer la ruta de lo que soltaste. Usa «Añadir carpeta».', 'error')
+        return
+      }
+      void handleImportPaths(paths)
+    }
+    window.addEventListener('dragover', onDragOver)
+    window.addEventListener('dragenter', onDragEnter)
+    window.addEventListener('dragleave', onDragLeave)
+    window.addEventListener('drop', onDrop)
+    return () => {
+      window.removeEventListener('dragover', onDragOver)
+      window.removeEventListener('dragenter', onDragEnter)
+      window.removeEventListener('dragleave', onDragLeave)
+      window.removeEventListener('drop', onDrop)
+      dragDepthRef.current = 0
+      setDropActive(false)
+    }
+  }, [auth?.status, handleImportPaths, showToast])
 
   const saveFolder = async (input: { name: string; emoji: string; color: string }): Promise<void> => {
     if (!folderDialog) return
@@ -345,6 +504,29 @@ export default function App(): JSX.Element {
     setPlayer(null)
     void refreshLibrary(true)
   }
+
+  const cancelImport = useCallback(
+    async (jobId: string): Promise<void> => {
+      try {
+        await api.library.cancelImport(jobId)
+      } catch (caught) {
+        showToast(cleanError(caught), 'error')
+      }
+    },
+    [showToast]
+  )
+
+  const retryImport = useCallback(
+    async (jobId: string): Promise<void> => {
+      try {
+        await api.library.retryImport(jobId)
+        showToast('Subida de nuevo en cola.', 'info')
+      } catch (caught) {
+        showToast(cleanError(caught), 'error')
+      }
+    },
+    [showToast]
+  )
 
   const activeImports = Object.values(imports).filter(
     (job) => job.status !== 'done' && job.status !== 'error' && job.status !== 'cancelled'
@@ -472,6 +654,7 @@ export default function App(): JSX.Element {
           onOpenLibrary={() => setView('library')}
           onOpenSettings={openSettings}
           onImport={() => void handleImport()}
+          onImportFolder={() => void handleImportFolder()}
           onCreateFolder={() => setFolderDialog({ mode: 'create' })}
           onEditFolder={(folder) => setFolderDialog({ mode: 'edit', folder })}
           onDeleteFolder={setDeleteFolder}
@@ -501,7 +684,9 @@ export default function App(): JSX.Element {
               streams={streams}
               onPlay={openPlayer}
               onImport={() => void handleImport()}
+              onImportFolder={() => void handleImportFolder()}
               onRefresh={refreshLibrary}
+              onLoadMore={loadMoreLibrary}
               onClearQuery={() => setQuery('')}
               onToast={showToast}
             />
@@ -527,6 +712,8 @@ export default function App(): JSX.Element {
 
       <ImportTray
         jobs={imports}
+        onCancel={(jobId) => void cancelImport(jobId)}
+        onRetry={(jobId) => void retryImport(jobId)}
         onDismiss={(jobId) =>
           setImports((current) => {
             const next = { ...current }
@@ -535,6 +722,21 @@ export default function App(): JSX.Element {
           })
         }
       />
+
+      {dropActive ? (
+        <div className="drop-overlay" aria-hidden="true">
+          <div className="drop-card">
+            <span className="drop-icon">
+              <Icon name="move_to_inbox" size={40} />
+            </span>
+            <h2>Suelta para añadir</h2>
+            <p>
+              Los vídeos sueltos van a la carpeta actual. Cada carpeta se convierte en una carpeta
+              de tu biblioteca con su contenido.
+            </p>
+          </div>
+        </div>
+      ) : null}
 
       <Toast toast={toast} onDismiss={() => setToast(null)} />
 
